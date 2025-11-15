@@ -1,0 +1,157 @@
+---
+- name: Bootstrap Talos Kubernetes Cluster
+  hosts: localhost
+  gather_facts: false
+  vars:
+    talos_secrets_file: "{{ playbook_dir }}/../secrets/secrets.yaml"
+    talos_config_dir: "{{ playbook_dir }}/../generated"
+    talos_patches_dir: "{{ playbook_dir }}/../patches"
+
+  tasks:
+    - name: Create required directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ talos_config_dir }}"
+        - "{{ playbook_dir }}/../secrets"
+        - "{{ talos_patches_dir }}"
+
+    - name: Generate Talos secrets
+      command: talosctl gen secrets -o {{ talos_secrets_file }}
+      args:
+        creates: "{{ talos_secrets_file }}"
+
+    - name: Create control plane patch file
+      template:
+        src: ../templates/controlplane-patch.yaml.j2
+        dest: "{{ talos_patches_dir }}/controlplane.yaml"
+
+    - name: Create worker patch file
+      template:
+        src: ../templates/worker-patch.yaml.j2
+        dest: "{{ talos_patches_dir }}/worker.yaml"
+
+    - name: Generate Talos machine configs
+      command: >
+        talosctl gen config {{ cluster_name }} https://{{ cluster_vip }}:6443
+        --with-secrets {{ talos_secrets_file }}
+        --config-patch-control-plane @{{ talos_patches_dir }}/controlplane.yaml
+        --config-patch-worker @{{ talos_patches_dir }}/worker.yaml
+        --output {{ talos_config_dir }}
+      args:
+        creates: "{{ talos_config_dir }}/controlplane.yaml"
+
+    - name: Wait for control plane nodes to boot (via DHCP initially)
+      wait_for:
+        host: "{{ hostvars[item].ansible_host }}"
+        port: 50000
+        timeout: 600
+        delay: 30
+      loop: "{{ groups['talos_control_plane'] }}"
+      ignore_errors: yes
+
+    - name: Wait for worker nodes to boot
+      wait_for:
+        host: "{{ hostvars[item].ansible_host }}"
+        port: 50000
+        timeout: 600
+        delay: 30
+      loop: "{{ groups['talos_workers'] }}"
+      ignore_errors: yes
+
+    - name: Apply config to control plane nodes
+      command: >
+        talosctl apply-config --insecure
+        --nodes {{ hostvars[item].ansible_host }}
+        --file {{ talos_config_dir }}/controlplane.yaml
+      loop: "{{ groups['talos_control_plane'] }}"
+      register: apply_control
+      until: apply_control.rc == 0
+      retries: 5
+      delay: 10
+
+    - name: Apply config to worker nodes
+      command: >
+        talosctl apply-config --insecure
+        --nodes {{ hostvars[item].ansible_host }}
+        --file {{ talos_config_dir }}/worker.yaml
+      loop: "{{ groups['talos_workers'] }}"
+      register: apply_worker
+      until: apply_worker.rc == 0
+      retries: 5
+      delay: 10
+
+    - name: Wait for nodes to apply static IP configuration
+      pause:
+        seconds: 90
+        prompt: "Waiting for Talos nodes to reconfigure network with static IPs..."
+
+    - name: Merge talosconfig
+      command: >
+        talosctl config merge {{ talos_config_dir }}/talosconfig
+      environment:
+        TALOSCONFIG: "{{ lookup('env', 'HOME') }}/.talos/config"
+
+    - name: Set talos endpoints
+      command: >
+        talosctl config endpoint {{ groups['talos_control_plane'] | map('extract', hostvars, 'ansible_host') | join(' ') }}
+
+    - name: Wait for nodes to be ready
+      command: >
+        talosctl health --nodes {{ hostvars[item].ansible_host }}
+      loop: "{{ groups['talos_control_plane'] }}"
+      register: health_check
+      until: health_check.rc == 0
+      retries: 10
+      delay: 30
+      ignore_errors: yes
+
+    - name: Bootstrap Kubernetes cluster
+      command: >
+        talosctl bootstrap --nodes {{ hostvars[groups['talos_control_plane'][0]].ansible_host }}
+      register: bootstrap
+      until: bootstrap.rc == 0
+      retries: 3
+      delay: 30
+
+    - name: Wait for Kubernetes API to be ready
+      command: >
+        talosctl kubeconfig {{ lookup('env', 'HOME') }}/.kube/config
+        --nodes {{ hostvars[groups['talos_control_plane'][0]].ansible_host }}
+        --force
+      register: kubeconfig
+      until: kubeconfig.rc == 0
+      retries: 15
+      delay: 30
+
+    - name: Wait for all nodes to join cluster
+      command: kubectl get nodes -o json
+      register: nodes_json
+      until: (nodes_json.stdout | from_json).items | length == (groups['talos_control_plane'] | length + groups['talos_workers'] | length)
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Get cluster status
+      command: kubectl get nodes -o wide
+      register: nodes
+      changed_when: false
+
+    - name: Display cluster status
+      debug:
+        msg: "{{ nodes.stdout_lines }}"
+
+    - name: Display cluster info
+      debug:
+        msg:
+          - "=== Cluster Bootstrap Complete ==="
+          - "Cluster Name: {{ cluster_name }}"
+          - "API Endpoint: https://{{ cluster_vip }}:6443"
+          - "Kubeconfig: ~/.kube/config"
+          - "Talosconfig: ~/.talos/config"
+          - ""
+          - "Next steps:"
+          - "  kubectl get nodes"
+          - "  kubectl get pods -A"

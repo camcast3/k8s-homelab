@@ -1,0 +1,14 @@
+machine:
+  network:
+    hostname: {{ inventory_hostname }}
+    interfaces:
+      - interface: eth0
+        addresses:
+          - {{ talos_static_ip }}/24
+        routes:
+          - network: 0.0.0.0/0
+            gateway: {{ gateway }}
+    nameservers:
+{% for ns in nameservers %}
+      - {{ ns }}
+{% endfor %}

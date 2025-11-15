@@ -1,0 +1,22 @@
+machine:
+  network:
+    hostname: {{ inventory_hostname }}
+    interfaces:
+      - interface: eth0
+        addresses:
+          - {{ talos_static_ip }}/24
+        routes:
+          - network: 0.0.0.0/0
+            gateway: {{ gateway }}
+        vip:
+          ip: {{ cluster_vip }}
+    nameservers:
+{% for ns in nameservers %}
+      - {{ ns }}
+{% endfor %}
+cluster:
+  controlPlane:
+    endpoint: https://{{ cluster_vip }}:6443
+  network:
+    cni:
+      name: none  # We'll install Cilium via ArgoCD later

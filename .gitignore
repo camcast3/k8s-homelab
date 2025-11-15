@@ -25,3 +25,20 @@ terraform.rc
 
 # Ignore log files
 *.log
+
+# Ansible generated files
+ansible/secrets/
+ansible/generated/
+ansible/patches/
+ansible/inventory/hosts.yml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

@@ -64,6 +64,17 @@ variable "talos_iso" {
   default     = "local:iso/talos-metal-amd64-v1.11.5.iso"
 }
 
+variable "kubernetes_version" {
+  description = "Kubernetes version (Talos v1.11 supports 1.29-1.34)"
+  type        = string
+  default     = "1.32.0"
+
+  validation {
+    condition     = can(regex("^1\\.(3[2-9]|[4-9][0-9])\\..*$", var.kubernetes_version))
+    error_message = "Kubernetes version must be 1.32.0 or higher (e.g., 1.32.0, 1.33.0, 1.34.0)."
+  }
+}
+
 variable "cluster_name" {
   description = "Kubernetes cluster name"
   type        = string

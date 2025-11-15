@@ -1,99 +1,94 @@
 # =============================================================================
-# VM Outputs
+# Outputs
 # =============================================================================
 
+# Control Plane Nodes
 output "control_plane_nodes" {
   description = "Control plane node details"
-  value = [
-    for i, vm in proxmox_vm_qemu.talos_control : {
-      name        = vm.name
-      vmid        = vm.vmid
-      target_node = vm.target_node
-      mac         = vm.network[0].macaddr
-      ip          = "${var.control_plane_ip_prefix}${var.control_plane_ip_start + i}"
-      proxmox_ip  = vm.default_ipv4_address
+  value = {
+    for idx, vm in proxmox_vm_qemu.talos_control : vm.name => {
+      vmid             = vm.vmid
+      target_node      = vm.target_node
+      mac_address      = vm.network[0].macaddr
+      expected_ip      = "${var.control_plane_ip_prefix}${var.control_plane_ip_start + idx}"
+      # Proxmox may provide the actual IP via agent or network info
+      actual_ip        = try(vm.default_ipv4_address, "pending")
     }
-  ]
+  }
 }
 
+# Worker Nodes
 output "worker_nodes" {
   description = "Worker node details"
-  value = [
-    for i, vm in proxmox_vm_qemu.talos_worker : {
-      name        = vm.name
-      vmid        = vm.vmid
-      target_node = vm.target_node
-      mac         = vm.network[0].macaddr
-      ip          = "${var.worker_ip_prefix}${var.worker_ip_start + i}"
-      proxmox_ip  = vm.default_ipv4_address
+  value = {
+    for idx, vm in proxmox_vm_qemu.talos_worker : vm.name => {
+      vmid             = vm.vmid
+      target_node      = vm.target_node
+      mac_address      = vm.network[0].macaddr
+      expected_ip      = "${var.worker_ip_prefix}${var.worker_ip_start + idx}"
+      actual_ip        = try(vm.default_ipv4_address, "pending")
     }
+  }
+}
+
+# Get actual IPs from Proxmox network data
+data "external" "control_plane_ips" {
+  count   = var.control_plane_count
+  program = ["bash", "-c", <<-EOT
+    ssh -o StrictHostKeyChecking=no root@${count.index % 2 == 0 ? split("//", var.pvebeast_url)[1] : var.proxmox_node_1} \
+      "qm guest cmd ${500 + count.index} network-get-interfaces 2>/dev/null | jq -r '.[] | select(.name==\"eth0\") | .[\"ip-addresses\"][] | select(.\"ip-address-type\"==\"ipv4\") | .[\"ip-address\"]' || echo '{}'" | \
+      jq -R -s '{ip: .}'
+  EOT
   ]
+  
+  depends_on = [proxmox_vm_qemu.talos_control]
 }
 
-output "cluster_endpoints" {
-  description = "Cluster endpoint information"
-  value = {
-    cluster_vip = var.cluster_vip
-    api_url     = "https://${var.cluster_vip}:6443"
-    control_ips = [
-      for i in range(var.control_plane_count) :
-      "${var.control_plane_ip_prefix}${var.control_plane_ip_start + i}"
-    ]
-  }
+data "external" "worker_ips" {
+  count   = var.worker_count
+  program = ["bash", "-c", <<-EOT
+    ssh -o StrictHostKeyChecking=no root@${count.index % 2 == 0 ? split("//", var.pvebeast_url)[1] : var.proxmox_node_1} \
+      "qm guest cmd ${510 + count.index} network-get-interfaces 2>/dev/null | jq -r '.[] | select(.name==\"eth0\") | .[\"ip-addresses\"][] | select(.\"ip-address-type\"==\"ipv4\") | .[\"ip-address\"]' || echo '{}'" | \
+      jq -R -s '{ip: .}'
+  EOT
+  ]
+  
+  depends_on = [proxmox_vm_qemu.talos_worker]
 }
 
-output "node_distribution" {
-  description = "VM distribution across Proxmox nodes"
-  value = {
-    proxmox_node_1 = {
-      control_plane = [
-        for i, vm in proxmox_vm_qemu.talos_control : vm.name
-        if vm.target_node == var.proxmox_node_1
-      ]
-      workers = [
-        for i, vm in proxmox_vm_qemu.talos_worker : vm.name
-        if vm.target_node == var.proxmox_node_1
-      ]
-    }
-    proxmox_node_2 = var.proxmox_node_2 != "" ? {
-      control_plane = [
-        for i, vm in proxmox_vm_qemu.talos_control : vm.name
-        if vm.target_node == var.proxmox_node_2
-      ]
-      workers = [
-        for i, vm in proxmox_vm_qemu.talos_worker : vm.name
-        if vm.target_node == var.proxmox_node_2
-      ]
-    } : null
-  }
-}
-
-# =============================================================================
-# Ansible Inventory Generation
-# =============================================================================
-
+# Generate Ansible Inventory with actual DHCP IPs
 resource "local_file" "ansible_inventory" {
   content = templatefile("${path.module}/templates/inventory.tpl", {
     control_nodes = [
-      for i in range(var.control_plane_count) : {
-        name = "talos-control-${i + 1}"
-        ip   = "${var.control_plane_ip_prefix}${var.control_plane_ip_start + i}"
-        mac  = proxmox_vm_qemu.talos_control[i].network[0].macaddr
+      for idx, vm in proxmox_vm_qemu.talos_control : {
+        name        = vm.name
+        mac         = vm.network[0].macaddr
+        expected_ip = "${var.control_plane_ip_prefix}${var.control_plane_ip_start + idx}"
+        dhcp_ip     = try(data.external.control_plane_ips[idx].result.ip, "${var.control_plane_ip_prefix}${var.control_plane_ip_start + idx}")
       }
     ]
     worker_nodes = [
-      for i in range(var.worker_count) : {
-        name = "talos-worker-${i + 1}"
-        ip   = "${var.worker_ip_prefix}${var.worker_ip_start + i}"
-        mac  = proxmox_vm_qemu.talos_worker[i].network[0].macaddr
+      for idx, vm in proxmox_vm_qemu.talos_worker : {
+        name        = vm.name
+        mac         = vm.network[0].macaddr
+        expected_ip = "${var.worker_ip_prefix}${var.worker_ip_start + idx}"
+        dhcp_ip     = try(data.external.worker_ips[idx].result.ip, "${var.worker_ip_prefix}${var.worker_ip_start + idx}")
       }
     ]
-    cluster_name = var.cluster_name
-    cluster_vip  = var.cluster_vip
-    gateway      = var.gateway
-    nameservers  = var.nameservers
+    cluster_name       = var.cluster_name
+    cluster_vip        = var.cluster_vip
+    gateway            = var.gateway
+    nameservers        = var.nameservers
+    kubernetes_version = var.kubernetes_version
   })
   filename = "${path.module}/../ansible/inventory/hosts.yml"
+
+  depends_on = [
+    proxmox_vm_qemu.talos_control,
+    proxmox_vm_qemu.talos_worker,
+    data.external.control_plane_ips,
+    data.external.worker_ips
+  ]
 }
 
 output "ansible_inventory_path" {

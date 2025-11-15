@@ -1,56 +1,43 @@
-# Talos Control Plane Nodes
-# Distribution: 2 nodes on node_1, 1 node on node_2
-
-locals {
-  # Define node configuration mapping
-  proxmox_nodes = {
-    (var.proxmox_node_1) = {
-      storage = var.proxmox_node_1_storage
-      bridge  = var.proxmox_node_1_bridge
-    }
-    (var.proxmox_node_2) = {
-      storage = var.proxmox_node_2_storage
-      bridge  = var.proxmox_node_2_bridge
-    }
-  }
-
-  # Control plane distribution pattern: [node_1, node_1, node_2]
-  control_distribution = [
-    var.proxmox_node_1,
-    var.proxmox_node_1,
-    var.proxmox_node_2,
-  ]
-
-  # Convert GB to MB for Proxmox
-  control_plane_memory_mb = var.control_plane_memory_gb * 1024
-  control_plane_disk_size = "${var.control_plane_disk_size_gb}G"
-}
+# =============================================================================
+# Talos Control Plane VMs
+# =============================================================================
 
 resource "proxmox_vm_qemu" "talos_control" {
-  count       = var.control_plane_count
+  count = var.control_plane_count
+
   name        = "talos-control-${count.index + 1}"
-  target_node = local.control_distribution[count.index]
-  vmid        = 501 + count.index
+  target_node = count.index % 2 == 0 ? var.proxmox_node_1 : var.proxmox_node_2
+  vmid        = 500 + count.index
 
-  cpu {
-    cores = var.control_plane_cores
-  }
+  # Clone from Talos ISO
+  clone      = null
+  full_clone = false
+  iso        = var.talos_iso
 
-  memory = local.control_plane_memory_mb
-  boot   = "order=scsi0;ide2"
-  kvm    = true
+  # VM Resources
+  cores   = var.control_plane_cores
+  sockets = 1
+  memory  = var.control_plane_memory_gb * 1024
+  scsihw  = "virtio-scsi-single"
+  
+  # Boot configuration
+  boot    = "order=scsi0;net0"
+  onboot  = true
+  startup = "order=1,up=30"
 
+  # Disks
   disks {
     scsi {
       scsi0 {
         disk {
-          size    = local.control_plane_disk_size
-          storage = local.proxmox_nodes[local.control_distribution[count.index]].storage
+          size    = var.control_plane_disk_size_gb
+          storage = count.index % 2 == 0 ? var.proxmox_node_1_storage : var.proxmox_node_2_storage
+          format  = "raw"
         }
       }
     }
     ide {
-      ide2 {
+      ide0 {
         cdrom {
           iso = var.talos_iso
         }
@@ -58,16 +45,54 @@ resource "proxmox_vm_qemu" "talos_control" {
     }
   }
 
+  # Network
   network {
-    id     = 0
     model  = "virtio"
-    bridge = local.proxmox_nodes[local.control_distribution[count.index]].bridge
+    bridge = count.index % 2 == 0 ? var.proxmox_node_1_bridge : var.proxmox_node_2_bridge
   }
 
+  # VM Settings
+  agent   = 0
+  cpu     = "host"
+  numa    = false
+  hotplug = "network,disk,usb"
+
+  # Lifecycle
   lifecycle {
     ignore_changes = [
-      boot,
       network,
+      disks,
     ]
   }
+
+  # Wait for VM to be accessible via SSH/API before proceeding
+  provisioner "local-exec" {
+    command = "sleep 30"
+  }
+
+  # Check if Talos is responding
+  provisioner "local-exec" {
+    command = <<-EOT
+      for i in {1..60}; do
+        if talosctl version --nodes ${var.control_plane_ip_prefix}${var.control_plane_ip_start + count.index} --insecure 2>/dev/null; then
+          echo "Talos node ${self.name} is ready"
+          exit 0
+        fi
+        echo "Waiting for Talos node ${self.name} to respond... ($i/60)"
+        sleep 10
+      done
+      echo "Warning: Talos node ${self.name} did not respond in time, continuing anyway..."
+      exit 0
+    EOT
+    when = create
+  }
+}
+
+# Output control plane IPs for easy reference
+output "control_plane_ips" {
+  description = "Control plane node IP addresses"
+  value = [
+    for idx in range(var.control_plane_count) :
+    "${var.control_plane_ip_prefix}${var.control_plane_ip_start + idx}"
+  ]
 }

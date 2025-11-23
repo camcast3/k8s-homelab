@@ -18,40 +18,27 @@ variable "proxmox_token_secret" {
   sensitive   = true
 }
 
-variable "proxmox_node_1" {
-  description = "Primary Proxmox node name"
-  type        = string
-  default     = "proxmox"
+variable "proxmox_nodes" {
+  description = "List of Proxmox nodes to distribute VMs across (if only one, all VMs go there)"
+  type        = list(string)
+  default     = ["pvebeast"]
+  
+  validation {
+    condition     = length(var.proxmox_nodes) > 0
+    error_message = "At least one Proxmox node must be specified."
+  }
 }
 
-variable "proxmox_node_2" {
-  description = "Secondary Proxmox node name (optional, leave empty if only one node)"
-  type        = string
-  default     = ""
+variable "proxmox_storage" {
+  description = "Storage pool name for each Proxmox node (maps to proxmox_nodes list)"
+  type        = list(string)
+  default     = ["local-lvm"]
 }
 
-variable "proxmox_node_1_storage" {
-  description = "Storage name for proxmox_node_1"
-  type        = string
-  default     = "local"
-}
-
-variable "proxmox_node_2_storage" {
-  description = "Storage name for proxmox_node_2"
-  type        = string
-  default     = "local"
-}
-
-variable "proxmox_node_1_bridge" {
-  description = "Network bridge for proxmox_node_1"
-  type        = string
-  default     = "vmbr0"
-}
-
-variable "proxmox_node_2_bridge" {
-  description = "Network bridge for proxmox_node_2"
-  type        = string
-  default     = "vmbr0"
+variable "proxmox_bridge" {
+  description = "Network bridge for each Proxmox node (maps to proxmox_nodes list)"
+  type        = list(string)
+  default     = ["vmbr0"]
 }
 
 # =============================================================================

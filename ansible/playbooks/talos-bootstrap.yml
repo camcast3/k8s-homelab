@@ -6,11 +6,12 @@
     talos_secrets_file: "{{ playbook_dir }}/../secrets/secrets.yaml"
     talos_config_dir: "{{ playbook_dir }}/../generated"
     talos_patches_dir: "{{ playbook_dir }}/../patches"
+    talos_templates_dir: "{{ playbook_dir }}/../templates"
     max_reset_attempts: 2
 
   tasks:
     - name: Create required directories
-      file:
+      ansible.builtin.file:
         path: "{{ item }}"
         state: directory
         mode: '0755'
@@ -20,14 +21,15 @@
         - "{{ talos_patches_dir }}"
 
     - name: Generate Talos secrets
-      command: talosctl gen secrets -o {{ talos_secrets_file }}
+      ansible.builtin.command: talosctl gen secrets -o {{ talos_secrets_file }}
       args:
         creates: "{{ talos_secrets_file }}"
 
     - name: Create control plane patch files for each node
-      template:
-        src: ../templates/controlplane-patch.yaml.j2
+      ansible.builtin.template:
+        src: "{{ talos_templates_dir }}/controlplane-patch.yaml.j2"
         dest: "{{ talos_patches_dir }}/controlplane-{{ item }}.yaml"
+        mode: '0644'
       loop: "{{ groups['talos_control_plane'] }}"
       vars:
         node_ip: "{{ hostvars[item].talos_static_ip }}"
@@ -38,9 +40,10 @@
         nameservers: "{{ hostvars[item].nameservers }}"
 
     - name: Create worker patch files for each node
-      template:
-        src: ../templates/worker-patch.yaml.j2
+      ansible.builtin.template:
+        src: "{{ talos_templates_dir }}/worker-patch.yaml.j2"
         dest: "{{ talos_patches_dir }}/worker-{{ item }}.yaml"
+        mode: '0644'
       loop: "{{ groups['talos_workers'] }}"
       vars:
         node_ip: "{{ hostvars[item].talos_static_ip }}"
@@ -49,80 +52,13 @@
         nameservers: "{{ hostvars[item].nameservers }}"
 
     - name: Generate base Talos machine configs with Kubernetes {{ hostvars[groups['all'][0]].kubernetes_version }}
-      command: >
+      ansible.builtin.command: >
         talosctl gen config {{ hostvars[groups['all'][0]].cluster_name }} https://{{ hostvars[groups['all'][0]].cluster_vip }}:6443
         --with-secrets {{ talos_secrets_file }}
         --kubernetes-version {{ hostvars[groups['all'][0]].kubernetes_version }}
         --output {{ talos_config_dir }}
       args:
         creates: "{{ talos_config_dir }}/controlplane.yaml"
-
-    - name: Apply config to control plane nodes
-      command: >
-        talosctl apply-config --insecure
-        --nodes {{ hostvars[item].ansible_host }}
-        --file {{ talos_config_dir }}/controlplane.yaml
-        --config-patch @{{ talos_patches_dir }}/controlplane-{{ item }}.yaml
-      loop: "{{ groups['talos_control_plane'] }}"
-      register: apply_control
-      until: apply_control.rc == 0
-      retries: 5
-      delay: 10
-
-    - name: Apply config to worker nodes
-      command: >
-        talosctl apply-config --insecure
-        --nodes {{ hostvars[item].ansible_host }}
-        --file {{ talos_config_dir }}/worker.yaml
-        --config-patch @{{ talos_patches_dir }}/worker-{{ item }}.yaml
-      loop: "{{ groups['talos_workers'] }}"
-      register: apply_worker
-      until: apply_worker.rc == 0
-      retries: 5
-      delay: 10
-
-    - name: Wait for nodes to apply static IP configuration and reboot
-      pause:
-        seconds: 90
-        prompt: "Waiting for Talos nodes to reconfigure network with static IPs..."
-
-    - name: Verify control plane nodes are accessible via static IP
-      command: talosctl version --nodes {{ hostvars[item].talos_static_ip }} --insecure
-      loop: "{{ groups['talos_control_plane'] }}"
-      register: static_ip_ready
-      until: static_ip_ready.rc == 0
-      retries: 30
-      delay: 10
-      changed_when: false
-
-    - name: Verify worker nodes are accessible via static IP
-      command: talosctl version --nodes {{ hostvars[item].talos_static_ip }} --insecure
-      loop: "{{ groups['talos_workers'] }}"
-      register: static_ip_ready
-      until: static_ip_ready.rc == 0
-      retries: 30
-      delay: 10
-      changed_when: false
-
-    - name: Merge talosconfig
-      command: >
-        talosctl config merge {{ talos_config_dir }}/talosconfig
-      environment:
-        TALOSCONFIG: "{{ lookup('env', 'HOME') }}/.talos/config"
-
-    - name: Set talos endpoints to static IPs
-      command: >
-        talosctl config endpoint {{ groups['talos_control_plane'] | map('extract', hostvars, 'talos_static_ip') | join(' ') }}
-
-    - name: Wait for control plane nodes to be healthy
-      command: >
-        talosctl health --nodes {{ hostvars[item].talos_static_ip }}
-      loop: "{{ groups['talos_control_plane'] }}"
-      register: health_check
-      until: health_check.rc == 0
-      retries: 20
-      delay: 15
-      changed_when: false
 
     # - name: Bootstrap Kubernetes cluster
     #   command: >
@@ -131,6 +67,62 @@
     #   until: bootstrap.rc == 0
     #   retries: 3
     #   delay: 30
+
+    # - name: Verify control plane nodes are accessible via static IP
+    #   command: talosctl version --nodes {{ hostvars[item].talos_static_ip }} --insecure
+    #   loop: "{{ groups['talos_control_plane'] }}"
+    #   register: static_ip_ready
+    #   until: static_ip_ready.rc == 0
+    #   retries: 30
+    #   delay: 10
+    #   changed_when: false
+
+    # - name: Verify worker nodes are accessible via static IP
+    #   command: talosctl version --nodes {{ hostvars[item].talos_static_ip }} --insecure
+    #   loop: "{{ groups['talos_workers'] }}"
+    #   register: static_ip_ready
+    #   until: static_ip_ready.rc == 0
+    #   retries: 30
+    #   delay: 10
+    #   changed_when: false
+
+    # - name: Wait for control plane nodes to be healthy
+    #   command: >
+    #     talosctl health --nodes {{ hostvars[item].talos_static_ip }}
+    #   loop: "{{ groups['talos_control_plane'] }}"
+    #   register: health_check
+    #   until: health_check.rc == 0
+    #   retries: 20
+    #   delay: 15
+    #   changed_when: false
+
+    # - name: Apply config to control plane nodes
+    #   command: >
+    #     talosctl apply-config --insecure
+    #     --nodes {{ hostvars[item].ansible_host }}
+    #     --file {{ talos_config_dir }}/controlplane.yaml
+    #     --config-patch @{{ talos_patches_dir }}/controlplane-{{ item }}.yaml
+    #   loop: "{{ groups['talos_control_plane'] }}"
+    #   register: apply_control
+    #   until: apply_control.rc == 0
+    #   retries: 5
+    #   delay: 10
+
+    # - name: Apply config to worker nodes
+    #   command: >
+    #     talosctl apply-config --insecure
+    #     --nodes {{ hostvars[item].ansible_host }}
+    #     --file {{ talos_config_dir }}/worker.yaml
+    #     --config-patch @{{ talos_patches_dir }}/worker-{{ item }}.yaml
+    #   loop: "{{ groups['talos_workers'] }}"
+    #   register: apply_worker
+    #   until: apply_worker.rc == 0
+    #   retries: 5
+    #   delay: 10
+
+    # - name: Set talos endpoints to static IPs
+    #   command: >
+    #     talosctl config endpoint {{ groups['talos_control_plane'] | map('extract', hostvars, 'talos_static_ip') | join(' ') }}
 
     # - name: Wait for Kubernetes API to be ready
     #   command: >

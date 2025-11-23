@@ -2,44 +2,61 @@
 # Talos Control Plane VMs
 # =============================================================================
 
+locals {
+  control_node_assignments = [
+    for idx in range(var.control_plane_count) :
+    idx % length(var.proxmox_nodes)
+  ]
+}
+
 resource "proxmox_vm_qemu" "talos_control" {
   count = var.control_plane_count
 
   name        = "talos-control-${count.index + 1}"
-  target_node = count.index % 2 == 0 ? var.proxmox_node_1 : var.proxmox_node_2
+  target_node = var.proxmox_nodes[local.control_node_assignments[count.index]]
   vmid        = 500 + count.index
 
-  # Clone from Talos ISO
+  # No clone - creating fresh VM
   clone      = null
   full_clone = false
-  iso        = var.talos_iso
 
-  # VM Resources
-  cores   = var.control_plane_cores
-  sockets = 1
+  # CPU Configuration
+  cpu {
+    cores   = var.control_plane_cores
+    sockets = 1
+    type    = "host"
+    numa    = false
+  }
+
+  # Memory
   memory  = var.control_plane_memory_gb * 1024
-  scsihw  = "virtio-scsi-single"
+  scsihw  = "virtio-scsi-pci"  # VirtIO SCSI (not single)
   
-  # Boot configuration
-  boot    = "order=scsi0;net0"
-  onboot  = true
-  startup = "order=1,up=30"
+  # Boot configuration - Talos recommended
+  boot    = "order=ide2;scsi0"  # Boot from CD-ROM first, then disk
+  bios    = "ovmf"              # UEFI
+  machine = "q35"               # Q35 machine type
+  onboot  = false
+  startup = ""
 
-  # Disks
+  # Disks - IDE CD-ROM + SCSI disk
   disks {
-    scsi {
-      scsi0 {
-        disk {
-          size    = var.control_plane_disk_size_gb
-          storage = count.index % 2 == 0 ? var.proxmox_node_1_storage : var.proxmox_node_2_storage
-          format  = "raw"
+    ide {
+      ide2 {
+        cdrom {
+          iso = var.talos_iso
         }
       }
     }
-    ide {
-      ide0 {
-        cdrom {
-          iso = var.talos_iso
+    scsi {
+      scsi0 {
+        disk {
+          size       = var.control_plane_disk_size_gb
+          storage    = var.proxmox_storage[local.control_node_assignments[count.index]]
+          discard    = true      # Enable discard
+          emulatessd = true      # SSD emulation
+          iothread   = true      # Enable IO thread
+          format     = "raw"
         }
       }
     }
@@ -47,52 +64,25 @@ resource "proxmox_vm_qemu" "talos_control" {
 
   # Network
   network {
+    id     = 0
     model  = "virtio"
-    bridge = count.index % 2 == 0 ? var.proxmox_node_1_bridge : var.proxmox_node_2_bridge
+    bridge = var.proxmox_bridge[local.control_node_assignments[count.index]]
+  }
+
+  # EFI disk for UEFI boot
+  efidisk {
+    efitype = "4m"
+    storage = var.proxmox_storage[local.control_node_assignments[count.index]]
   }
 
   # VM Settings
-  agent   = 0
-  cpu     = "host"
-  numa    = false
-  hotplug = "network,disk,usb"
+  agent   = 1
+  hotplug = "disk,network,usb"  # No memory or CPU hotplug for Talos
 
-  # Lifecycle
   lifecycle {
     ignore_changes = [
       network,
       disks,
     ]
   }
-
-  # Wait for VM to be accessible via SSH/API before proceeding
-  provisioner "local-exec" {
-    command = "sleep 30"
-  }
-
-  # Check if Talos is responding
-  provisioner "local-exec" {
-    command = <<-EOT
-      for i in {1..60}; do
-        if talosctl version --nodes ${var.control_plane_ip_prefix}${var.control_plane_ip_start + count.index} --insecure 2>/dev/null; then
-          echo "Talos node ${self.name} is ready"
-          exit 0
-        fi
-        echo "Waiting for Talos node ${self.name} to respond... ($i/60)"
-        sleep 10
-      done
-      echo "Warning: Talos node ${self.name} did not respond in time, continuing anyway..."
-      exit 0
-    EOT
-    when = create
-  }
-}
-
-# Output control plane IPs for easy reference
-output "control_plane_ips" {
-  description = "Control plane node IP addresses"
-  value = [
-    for idx in range(var.control_plane_count) :
-    "${var.control_plane_ip_prefix}${var.control_plane_ip_start + idx}"
-  ]
 }

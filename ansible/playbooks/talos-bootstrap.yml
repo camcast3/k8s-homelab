@@ -1,157 +1,379 @@
----
-- name: Bootstrap Talos Kubernetes Cluster
+- name: Discover Talos VM IPs
   hosts: localhost
   gather_facts: false
+  vars_files:
+    - ../group_vars/all/vault.yml
   vars:
-    talos_secrets_file: "{{ playbook_dir }}/../secrets/secrets.yaml"
-    talos_config_dir: "{{ playbook_dir }}/../generated"
-    talos_patches_dir: "{{ playbook_dir }}/../patches"
+    proxmox_host: "{{ lookup('env', 'PROXMOX_HOST') | default('192.168.86.2', true) }}"
+    proxmox_api_user: "{{ lookup('env', 'PROXMOX_API_USER') | default('opentofu-prov@pve', true) }}"
+    proxmox_api_token_name: "opentofutokenPVE"
+    proxmox_api_token_value: "{{ vault_proxmox_api_token_secret }}"
+    proxmox_node: "pvebeast"
+    control_plane_vmids: [500, 501, 502]
+    worker_vmids: [510, 511, 512]
+  
+  tasks:
+    - name: Debug - Show API credentials
+      ansible.builtin.debug:
+        msg:
+          - "Proxmox Host: {{ proxmox_host }}"
+          - "API User: {{ proxmox_api_user }}"
+          - "Token Name: {{ proxmox_api_token_name }}"
+          - "Token Value (first 10 chars): {{ proxmox_api_token_value[:10] }}..."
+          - "Node: {{ proxmox_node }}"
+
+    - name: Debug - Test API connectivity
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/version"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
+        validate_certs: false
+        return_content: true
+      register: api_version_test
+      ignore_errors: false
+
+    - name: Debug - Show API version response
+      ansible.builtin.debug:
+        var: api_version_test
+
+    - name: Debug - Test single VM status
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ control_plane_vmids[0] }}/status/current"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
+        validate_certs: false
+        return_content: true
+      register: vm_status_test
+      ignore_errors: false
+
+    - name: Debug - Show VM status response
+      ansible.builtin.debug:
+        var: vm_status_test
+
+    - name: Debug - Test guest agent call
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ control_plane_vmids[0] }}/agent/network-get-interfaces"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
+        validate_certs: false
+        return_content: true
+      register: guest_agent_test
+      ignore_errors: false
+
+    - name: Debug - Show guest agent response
+      ansible.builtin.debug:
+        var: guest_agent_test
+
+    - name: Get control plane DHCP IPs via Proxmox API
+      ansible.builtin.shell:
+        cmd: |
+          curl -k -s -H "Authorization: PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}" \
+            "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item }}/agent/network-get-interfaces" | \
+            jq -r '.data.result[] | select(.name=="ens18") | .["ip-addresses"][] | select(.["ip-address-type"]=="ipv4") | select(.["ip-address"] | startswith("127") | not) | .["ip-address"]'
+      register: control_dhcp_ips
+      loop: "{{ control_plane_vmids }}"
+      changed_when: false
+      retries: 10
+      delay: 5
+      until: control_dhcp_ips.stdout != ""
+
+    - name: Get worker DHCP IPs via Proxmox API
+      ansible.builtin.shell:
+        cmd: |
+          curl -k -s -H "Authorization: PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}" \
+            "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item }}/agent/network-get-interfaces" | \
+            jq -r '.data.result[] | select(.name=="ens18") | .["ip-addresses"][] | select(.["ip-address-type"]=="ipv4") | select(.["ip-address"] | startswith("127") | not) | .["ip-address"]'
+      register: worker_dhcp_ips
+      loop: "{{ worker_vmids }}"
+      changed_when: false
+      retries: 10
+      delay: 5
+      until: worker_dhcp_ips.stdout != ""
+
+    - name: Build dynamic inventory for control plane
+      ansible.builtin.add_host:
+        name: "talos-control-{{ idx + 1 }}"
+        groups: talos_control_plane
+        ansible_host: "{{ item.stdout }}"
+        talos_static_ip: "192.168.86.{{ 3 + idx }}"
+        vmid: "{{ control_plane_vmids[idx] }}"
+        node_type: control
+      loop: "{{ control_dhcp_ips.results }}"
+      loop_control:
+        index_var: idx
+
+    - name: Build dynamic inventory for workers
+      ansible.builtin.add_host:
+        name: "talos-worker-{{ idx + 1 }}"
+        groups: talos_workers
+        ansible_host: "{{ item.stdout }}"
+        talos_static_ip: "192.168.86.{{ 10 + idx }}"
+        vmid: "{{ worker_vmids[idx] }}"
+        node_type: worker
+      loop: "{{ worker_dhcp_ips.results }}"
+      loop_control:
+        index_var: idx
+
+    - name: Display discovered IPs
+      ansible.builtin.debug:
+        msg:
+          - "=== Discovered DHCP IPs ==="
+          - "Control Plane:"
+          - "{% for result in control_dhcp_ips.results %}  talos-control-{{ loop.index }}: {{ result.stdout }} -> 192.168.86.{{ 3 + loop.index0 }}{% endfor %}"
+          - "Workers:"
+          - "{% for result in worker_dhcp_ips.results %}  talos-worker-{{ loop.index }}: {{ result.stdout }} -> 192.168.86.{{ 10 + loop.index0 }}{% endfor %}"
+
+    - name: Confirm before continuing
+      pause:
+        prompt: "Look at the IP matches above and check if they match. Type 'yes' to continue or 'no' to abort."
+      register: user_response
+
+    - name: Exit playbook if user says no
+      ansible.builtin.fail:
+        msg: "❌ Playbook aborted by user - IP validation failed"
+      when: user_response.user_input | lower not in ['yes', 'y']
+
+    - name: Continue with tasks
+      ansible.builtin.debug:
+        msg: "Proceeding with the next steps..."
+
+- name: Bootstrap Talos Cluster
+  hosts: localhost
+  gather_facts: false
+  strategy: linear
+  vars:
+    cluster_name: test
+    cluster_vip: "192.168.86.100"
+    gateway: "192.168.86.1"
+    nameservers: ["192.168.25.19"]
+    kubernetes_version: "v1.33.6"
+    talos_version: "v1.11.5"
+    # Factory image with QEMU guest agent support
+    qemu_installer_image: "factory.talos.dev/installer/ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515:v1.11.5"
+    config_dir: "~/repos/k8_homelab/talos/{{ cluster_name }}-config"
+    template_dir: "~/repos/k8_homelab/ansible/templates"
+    patch_dir: "~/repos/k8_homelab/ansible/patches"
 
   tasks:
-    - name: Create required directories
-      file:
-        path: "{{ item }}"
+    - name: Create Talos config directory
+      ansible.builtin.file:
+        path: "{{ config_dir }}"
         state: directory
         mode: '0755'
-      loop:
-        - "{{ talos_config_dir }}"
-        - "{{ playbook_dir }}/../secrets"
-        - "{{ talos_patches_dir }}"
 
-    - name: Generate Talos secrets
-      command: talosctl gen secrets -o {{ talos_secrets_file }}
-      args:
-        creates: "{{ talos_secrets_file }}"
+    - name: Check if Talos config already exists
+      ansible.builtin.stat:
+        path: "{{ config_dir }}/talosconfig"
+      register: talos_config_exists
 
-    - name: Create control plane patch file
-      template:
-        src: ../templates/controlplane-patch.yaml.j2
-        dest: "{{ talos_patches_dir }}/controlplane.yaml"
+    - name: Generate Talos machine configurations with QEMU guest agent installer
+      ansible.builtin.command:
+        cmd: >
+          talosctl gen config {{ cluster_name }}
+          https://{{ cluster_vip }}:6443  
+          --output-dir {{ config_dir }}
+          --install-image {{ qemu_installer_image }}
+      when: not talos_config_exists.stat.exists
+      changed_when: true
 
-    - name: Create worker patch file
-      template:
-        src: ../templates/worker-patch.yaml.j2
-        dest: "{{ talos_patches_dir }}/worker.yaml"
+    - name: Create control plane patch files
+      ansible.builtin.template:
+        src: "{{ template_dir }}/controlplane-patch.yaml.j2"
+        dest: "{{ patch_dir }}/controlplane-{{ item.inventory_hostname }}.yaml"
+        mode: '0644'
+      loop: "{{ groups['talos_control_plane'] | map('extract', hostvars) | list }}"
+      loop_control:
+        label: "{{ item.inventory_hostname }}"
 
-    - name: Generate Talos machine configs
-      command: >
-        talosctl gen config {{ cluster_name }} https://{{ cluster_vip }}:6443
-        --with-secrets {{ talos_secrets_file }}
-        --config-patch-control-plane @{{ talos_patches_dir }}/controlplane.yaml
-        --config-patch-worker @{{ talos_patches_dir }}/worker.yaml
-        --output {{ talos_config_dir }}
-      args:
-        creates: "{{ talos_config_dir }}/controlplane.yaml"
+    - name: Create worker patch files
+      ansible.builtin.template:
+        src: "{{ template_dir }}/worker-patch.yaml.j2"
+        dest: "{{ patch_dir }}/worker-{{ item.inventory_hostname }}.yaml"
+        mode: '0644'
+      loop: "{{ groups['talos_workers'] | map('extract', hostvars) | list }}"
+      loop_control:
+        label: "{{ item.inventory_hostname }}"
 
-    - name: Wait for control plane nodes to boot (via DHCP initially)
-      wait_for:
+    # - name: Confirm before continuing
+    #   pause:
+    #     prompt: "Look at the generated patches for debugging. Type 'yes' to continue or 'no' to abort."
+    #   register: user_response_patches
+
+    # - name: Exit playbook if user says no
+    #   ansible.builtin.fail:
+    #     msg: "❌ Playbook aborted by user - patch review failed"
+    #   when: user_response_patches.user_input | lower not in ['yes', 'y']
+
+    # - name: Continue with tasks
+    #   ansible.builtin.debug:
+    #     msg: "Proceeding with the next steps..."
+
+    - name: Wait for Talos API to be available on control plane nodes
+      ansible.builtin.wait_for:
         host: "{{ hostvars[item].ansible_host }}"
         port: 50000
-        timeout: 600
+        timeout: 300
+        delay: 10
+      loop: "{{ groups['talos_control_plane'] }}"
+
+    # - name: Apply configuration to control plane nodes
+    #   ansible.builtin.command:
+    #     cmd: >
+    #       talosctl apply-config
+    #       --insecure
+    #       --nodes {{ hostvars[item].ansible_host }}
+    #       --file {{ config_dir }}/controlplane.yaml
+    #       --config-patch @{{ playbook_dir }}/../patches/controlplane-{{ item }}.yaml
+    #   loop: "{{ groups['talos_control_plane'] }}"
+    #   changed_when: true
+    #   register: control_apply
+    #   retries: 3
+    #   delay: 10
+    #   until: control_apply.rc == 0
+
+    - name: Wait for control plane nodes to reboot with static IPs
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[item].talos_static_ip }}"
+        port: 50000
+        timeout: 300
         delay: 30
       loop: "{{ groups['talos_control_plane'] }}"
-      ignore_errors: yes
 
-    - name: Wait for worker nodes to boot
-      wait_for:
+    - name: Wait for Talos API to be available on worker nodes
+      ansible.builtin.wait_for:
         host: "{{ hostvars[item].ansible_host }}"
         port: 50000
-        timeout: 600
+        timeout: 300
+        delay: 10
+      loop: "{{ groups['talos_workers'] }}"
+
+    # - name: Apply configuration to worker nodes
+    #   ansible.builtin.command:
+    #     cmd: >
+    #       talosctl apply-config
+    #       --insecure
+    #       --nodes {{ hostvars[item].ansible_host }}
+    #       --file {{ config_dir }}/worker.yaml
+    #       --config-patch @{{ playbook_dir }}/../patches/worker-{{ item }}.yaml
+    #   loop: "{{ groups['talos_workers'] }}"
+    #   changed_when: true
+    #   register: worker_apply
+    #   retries: 3
+    #   delay: 10
+    #   until: worker_apply.rc == 0
+
+    - name: Wait for worker nodes to reboot with static IPs
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[item].talos_static_ip }}"
+        port: 50000
+        timeout: 300
         delay: 30
       loop: "{{ groups['talos_workers'] }}"
-      ignore_errors: yes
 
-    - name: Apply config to control plane nodes
-      command: >
-        talosctl apply-config --insecure
-        --nodes {{ hostvars[item].ansible_host }}
-        --file {{ talos_config_dir }}/controlplane.yaml
-      loop: "{{ groups['talos_control_plane'] }}"
-      register: apply_control
-      until: apply_control.rc == 0
-      retries: 5
-      delay: 10
-
-    - name: Apply config to worker nodes
-      command: >
-        talosctl apply-config --insecure
-        --nodes {{ hostvars[item].ansible_host }}
-        --file {{ talos_config_dir }}/worker.yaml
-      loop: "{{ groups['talos_workers'] }}"
-      register: apply_worker
-      until: apply_worker.rc == 0
-      retries: 5
-      delay: 10
-
-    - name: Wait for nodes to apply static IP configuration
-      pause:
-        seconds: 90
-        prompt: "Waiting for Talos nodes to reconfigure network with static IPs..."
-
-    - name: Merge talosconfig
-      command: >
-        talosctl config merge {{ talos_config_dir }}/talosconfig
-      environment:
-        TALOSCONFIG: "{{ lookup('env', 'HOME') }}/.talos/config"
-
-    - name: Set talos endpoints
-      command: >
-        talosctl config endpoint {{ groups['talos_control_plane'] | map('extract', hostvars, 'ansible_host') | join(' ') }}
-
-    - name: Wait for nodes to be ready
-      command: >
-        talosctl health --nodes {{ hostvars[item].ansible_host }}
-      loop: "{{ groups['talos_control_plane'] }}"
-      register: health_check
-      until: health_check.rc == 0
-      retries: 10
-      delay: 30
-      ignore_errors: yes
-
-    - name: Bootstrap Kubernetes cluster
-      command: >
-        talosctl bootstrap --nodes {{ hostvars[groups['talos_control_plane'][0]].ansible_host }}
-      register: bootstrap
-      until: bootstrap.rc == 0
-      retries: 3
-      delay: 30
-
-    - name: Wait for Kubernetes API to be ready
-      command: >
-        talosctl kubeconfig {{ lookup('env', 'HOME') }}/.kube/config
-        --nodes {{ hostvars[groups['talos_control_plane'][0]].ansible_host }}
-        --force
-      register: kubeconfig
-      until: kubeconfig.rc == 0
-      retries: 15
-      delay: 30
-
-    - name: Wait for all nodes to join cluster
-      command: kubectl get nodes -o json
-      register: nodes_json
-      until: (nodes_json.stdout | from_json).items | length == (groups['talos_control_plane'] | length + groups['talos_workers'] | length)
-      retries: 20
-      delay: 15
+    - name: Check if cluster is already bootstrapped
+      ansible.builtin.command:
+        cmd: >
+          talosctl health
+          --talosconfig {{ config_dir }}/talosconfig
+      register: cluster_health
+      failed_when: false
       changed_when: false
 
-    - name: Get cluster status
-      command: kubectl get nodes -o wide
-      register: nodes
+    - name: Bootstrap the Talos cluster
+      ansible.builtin.command:
+        cmd: >
+          talosctl bootstrap
+          --nodes {{ hostvars[groups['talos_control_plane'][0]].talos_static_ip }}
+          --endpoints {{ hostvars[groups['talos_control_plane'][0]].talos_static_ip }}
+          --talosconfig {{ config_dir }}/talosconfig
+      when: cluster_health.rc != 0
+      changed_when: true
+
+    - name: Check if kubeconfig already exists
+      ansible.builtin.stat:
+        path: "{{ config_dir }}/kubeconfig"
+      register: kubeconfig_exists
+
+    - name: Retrieve kubeconfig
+      ansible.builtin.command:
+        cmd: >
+          talosctl kubeconfig {{ config_dir }}/kubeconfig
+          --nodes {{ cluster_vip }}
+          --endpoints {{ cluster_vip }}
+          --talosconfig {{ config_dir }}/talosconfig
+          --force
+      when: not kubeconfig_exists.stat.exists or (kubeconfig_exists.stat.exists and cluster_health.rc != 0)
+      changed_when: true
+
+    - name: Create .kube directory
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/.kube"
+        state: directory
+        mode: '0755'
+
+    - name: Create .talos directory
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/.talos"
+        state: directory
+        mode: '0755'
+
+    - name: Copy kubeconfig to user directory
+      ansible.builtin.copy:
+        src: "{{ config_dir }}/kubeconfig"
+        dest: "{{ lookup('env', 'HOME') }}/.kube/config-{{ cluster_name }}"
+        mode: '0600'
+
+    - name: Copy talosconfig to user directory
+      ansible.builtin.copy:
+        src: "{{ config_dir }}/talosconfig"
+        dest: "{{ lookup('env', 'HOME') }}/.talos/config-{{ cluster_name }}"
+        mode: '0600'
+
+# I want to automate changing the IP of a VM using the Unifi DHCP before bootstrapping
+
+# had to remove cdrom as the first boot for VM so that the hard disk was used instead
+
+# Set talosctl kubeconfig --talosconfig talosconfig
+
+# Setup https://docs.cilium.io/en/stable/gettingstarted/k8s-install-default/#k8s-install-quick
+
+# Install CNI Plugin Cillium https://docs.siderolabs.com/kubernetes-guides/cni/deploying-cilium#without-kube-proxy
+
+# Make sure Cilium is running properly with `cilium status` 
+
+# At this point all the nodes should be in a ready state
+
+    - name: Wait for all nodes to be ready
+      ansible.builtin.command:
+        cmd: kubectl get nodes --kubeconfig={{ config_dir }}/kubeconfig
+      register: nodes_status
+      until: nodes_status.stdout.find('NotReady') == -1
+      retries: 30
+      delay: 10
       changed_when: false
 
-    - name: Display cluster status
-      debug:
-        msg: "{{ nodes.stdout_lines }}"
-
-    - name: Display cluster info
-      debug:
+    - name: Display cluster access info
+      ansible.builtin.debug:
         msg:
-          - "=== Cluster Bootstrap Complete ==="
-          - "Cluster Name: {{ cluster_name }}"
-          - "API Endpoint: https://{{ cluster_vip }}:6443"
-          - "Kubeconfig: ~/.kube/config"
-          - "Talosconfig: ~/.talos/config"
+          - "✅ Talos cluster bootstrapped successfully!"
           - ""
-          - "Next steps:"
+          - "Cluster Access:"
+          - "  Talos Config: {{ config_dir }}/talosconfig"
+          - "  Kubeconfig: {{ config_dir }}/kubeconfig"
+          - "  Cluster VIP: {{ cluster_vip }}"
+          - ""
+          - "Configs also copied to:"
+          - "  ~/.kube/config-{{ cluster_name }}"
+          - "  ~/.talos/config-{{ cluster_name }}"
+          - ""
+          - "Commands:"
+          - "  export TALOSCONFIG={{ config_dir }}/talosconfig"
+          - "  export KUBECONFIG={{ config_dir }}/kubeconfig"
+          - "  talosctl --nodes {{ cluster_vip }} dashboard"
           - "  kubectl get nodes"
-          - "  kubectl get pods -A"
+          - ""
+          - "Node IPs:"
+          - "{% for host in groups['talos_control_plane'] %}  {{ host }}: {{ hostvars[host].talos_static_ip }}{% endfor %}"

@@ -1,102 +1,122 @@
 # =============================================================================
-# VM Outputs
+# Outputs
 # =============================================================================
 
-output "control_plane_nodes" {
-  description = "Control plane node details"
-  value = [
-    for i, vm in proxmox_vm_qemu.talos_control : {
-      name        = vm.name
-      vmid        = vm.vmid
-      target_node = vm.target_node
-      mac         = vm.network[0].macaddr
-      ip          = "${var.control_plane_ip_prefix}${var.control_plane_ip_start + i}"
-      proxmox_ip  = vm.default_ipv4_address
-    }
-  ]
-}
-
-output "worker_nodes" {
-  description = "Worker node details"
-  value = [
-    for i, vm in proxmox_vm_qemu.talos_worker : {
-      name        = vm.name
-      vmid        = vm.vmid
-      target_node = vm.target_node
-      mac         = vm.network[0].macaddr
-      ip          = "${var.worker_ip_prefix}${var.worker_ip_start + i}"
-      proxmox_ip  = vm.default_ipv4_address
-    }
-  ]
-}
-
-output "cluster_endpoints" {
-  description = "Cluster endpoint information"
+# Control Plane Nodes Distribution
+output "control_plane_distribution" {
+  description = "Control plane VM distribution across Proxmox nodes"
   value = {
-    cluster_vip = var.cluster_vip
-    api_url     = "https://${var.cluster_vip}:6443"
-    control_ips = [
-      for i in range(var.control_plane_count) :
-      "${var.control_plane_ip_prefix}${var.control_plane_ip_start + i}"
-    ]
+    for idx, vm in proxmox_vm_qemu.talos_control : vm.name => {
+      proxmox_node = vm.target_node
+      vmid         = vm.vmid
+      ip           = "${var.control_plane_ip_prefix}${var.control_plane_ip_start + idx}"
+      mac          = try(vm.network[0].macaddr, "pending")
+    }
   }
 }
 
-output "node_distribution" {
-  description = "VM distribution across Proxmox nodes"
+# Worker Nodes Distribution
+output "worker_distribution" {
+  description = "Worker VM distribution across Proxmox nodes"
   value = {
-    proxmox_node_1 = {
-      control_plane = [
-        for i, vm in proxmox_vm_qemu.talos_control : vm.name
-        if vm.target_node == var.proxmox_node_1
-      ]
-      workers = [
-        for i, vm in proxmox_vm_qemu.talos_worker : vm.name
-        if vm.target_node == var.proxmox_node_1
-      ]
+    for idx, vm in proxmox_vm_qemu.talos_worker : vm.name => {
+      proxmox_node = vm.target_node
+      vmid         = vm.vmid
+      ip           = "${var.worker_ip_prefix}${var.worker_ip_start + idx}"
+      mac          = try(vm.network[0].macaddr, "pending")
     }
-    proxmox_node_2 = var.proxmox_node_2 != "" ? {
-      control_plane = [
-        for i, vm in proxmox_vm_qemu.talos_control : vm.name
-        if vm.target_node == var.proxmox_node_2
-      ]
-      workers = [
-        for i, vm in proxmox_vm_qemu.talos_worker : vm.name
-        if vm.target_node == var.proxmox_node_2
-      ]
-    } : null
   }
 }
 
-# =============================================================================
-# Ansible Inventory Generation
-# =============================================================================
+# All Nodes Summary
+output "cluster_summary" {
+  description = "Complete cluster configuration summary"
+  value = {
+    cluster_name       = var.cluster_name
+    cluster_vip        = var.cluster_vip
+    kubernetes_version = var.kubernetes_version
+    proxmox_nodes      = var.proxmox_nodes
+    
+    control_plane = {
+      count = var.control_plane_count
+      nodes = [
+        for idx in range(var.control_plane_count) : {
+          name         = "talos-control-${idx + 1}"
+          vmid         = 500 + idx
+          ip           = "${var.control_plane_ip_prefix}${var.control_plane_ip_start + idx}"
+          proxmox_host = var.proxmox_nodes[idx % length(var.proxmox_nodes)]
+        }
+      ]
+    }
+    
+    workers = {
+      count = var.worker_count
+      nodes = [
+        for idx in range(var.worker_count) : {
+          name         = "talos-worker-${idx + 1}"
+          vmid         = 510 + idx
+          ip           = "${var.worker_ip_prefix}${var.worker_ip_start + idx}"
+          proxmox_host = var.proxmox_nodes[idx % length(var.proxmox_nodes)]
+        }
+      ]
+    }
+  }
+}
 
+# Generate Ansible Inventory (only after VMs are created)
 resource "local_file" "ansible_inventory" {
   content = templatefile("${path.module}/templates/inventory.tpl", {
     control_nodes = [
-      for i in range(var.control_plane_count) : {
-        name = "talos-control-${i + 1}"
-        ip   = "${var.control_plane_ip_prefix}${var.control_plane_ip_start + i}"
-        mac  = proxmox_vm_qemu.talos_control[i].network[0].macaddr
+      for idx in range(var.control_plane_count) : {
+        name = "talos-control-${idx + 1}"
+        ip   = "${var.control_plane_ip_prefix}${var.control_plane_ip_start + idx}"
+        mac  = try(proxmox_vm_qemu.talos_control[idx].network[0].macaddr, "00:00:00:00:00:00")
       }
     ]
     worker_nodes = [
-      for i in range(var.worker_count) : {
-        name = "talos-worker-${i + 1}"
-        ip   = "${var.worker_ip_prefix}${var.worker_ip_start + i}"
-        mac  = proxmox_vm_qemu.talos_worker[i].network[0].macaddr
+      for idx in range(var.worker_count) : {
+        name = "talos-worker-${idx + 1}"
+        ip   = "${var.worker_ip_prefix}${var.worker_ip_start + idx}"
+        mac  = try(proxmox_vm_qemu.talos_worker[idx].network[0].macaddr, "00:00:00:00:00:00")
       }
     ]
-    cluster_name = var.cluster_name
-    cluster_vip  = var.cluster_vip
-    gateway      = var.gateway
-    nameservers  = var.nameservers
+    cluster_name       = var.cluster_name
+    cluster_vip        = var.cluster_vip
+    gateway            = var.gateway
+    nameservers        = var.nameservers
+    kubernetes_version = var.kubernetes_version
   })
   filename = "${path.module}/../ansible/inventory/hosts.yml"
+
+  depends_on = [
+    proxmox_vm_qemu.talos_control,
+    proxmox_vm_qemu.talos_worker
+  ]
 }
 
 output "ansible_inventory_path" {
   description = "Path to generated Ansible inventory"
   value       = local_file.ansible_inventory.filename
+}
+
+# Quick reference outputs
+output "control_plane_ips" {
+  description = "Control plane node IP addresses"
+  value = [
+    for idx in range(var.control_plane_count) :
+    "${var.control_plane_ip_prefix}${var.control_plane_ip_start + idx}"
+  ]
+}
+
+output "worker_ips" {
+  description = "Worker node IP addresses"
+  value = [
+    for idx in range(var.worker_count) :
+    "${var.worker_ip_prefix}${var.worker_ip_start + idx}"
+  ]
+}
+
+output "cluster_endpoint" {
+  description = "Kubernetes cluster API endpoint"
+  value       = "https://${var.cluster_vip}:6443"
 }

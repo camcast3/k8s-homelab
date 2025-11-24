@@ -1,54 +1,46 @@
-# Talos Control Plane Nodes
-# Distribution: 2 nodes on node_1, 1 node on node_2
+# =============================================================================
+# Talos Control Plane VMs
+# =============================================================================
 
 locals {
-  # Define node configuration mapping
-  proxmox_nodes = {
-    (var.proxmox_node_1) = {
-      storage = var.proxmox_node_1_storage
-      bridge  = var.proxmox_node_1_bridge
-    }
-    (var.proxmox_node_2) = {
-      storage = var.proxmox_node_2_storage
-      bridge  = var.proxmox_node_2_bridge
-    }
-  }
-
-  # Control plane distribution pattern: [node_1, node_1, node_2]
-  control_distribution = [
-    var.proxmox_node_1,
-    var.proxmox_node_1,
-    var.proxmox_node_2,
+  control_node_assignments = [
+    for idx in range(var.control_plane_count) :
+    idx % length(var.proxmox_nodes)
   ]
-
-  # Convert GB to MB for Proxmox
-  control_plane_memory_mb = var.control_plane_memory_gb * 1024
-  control_plane_disk_size = "${var.control_plane_disk_size_gb}G"
 }
 
 resource "proxmox_vm_qemu" "talos_control" {
-  count       = var.control_plane_count
-  name        = "talos-control-${count.index + 1}"
-  target_node = local.control_distribution[count.index]
-  vmid        = 501 + count.index
+  count = var.control_plane_count
 
+  name        = "talos-control-${count.index + 1}"
+  target_node = var.proxmox_nodes[local.control_node_assignments[count.index]]
+  vmid        = 500 + count.index
+
+  # No clone - creating fresh VM
+  clone      = null
+  full_clone = false
+
+  # CPU Configuration
   cpu {
-    cores = var.control_plane_cores
+    cores   = var.control_plane_cores
+    sockets = 1
+    type    = "host"
+    numa    = false
   }
 
-  memory = local.control_plane_memory_mb
-  boot   = "order=scsi0;ide2"
-  kvm    = true
+  # Memory
+  memory  = var.control_plane_memory_gb * 1024
+  scsihw  = "virtio-scsi-pci"  # VirtIO SCSI (not single)
+  
+  # Boot configuration - Talos recommended
+  boot    = "order=ide2;scsi0"  # Boot from CD-ROM first, then disk
+  bios    = "ovmf"              # UEFI
+  machine = "q35"               # Q35 machine type
+  onboot  = false
+  startup = ""
 
+  # Disks - IDE CD-ROM + SCSI disk
   disks {
-    scsi {
-      scsi0 {
-        disk {
-          size    = local.control_plane_disk_size
-          storage = local.proxmox_nodes[local.control_distribution[count.index]].storage
-        }
-      }
-    }
     ide {
       ide2 {
         cdrom {
@@ -56,18 +48,41 @@ resource "proxmox_vm_qemu" "talos_control" {
         }
       }
     }
+    scsi {
+      scsi0 {
+        disk {
+          size       = var.control_plane_disk_size_gb
+          storage    = var.proxmox_storage[local.control_node_assignments[count.index]]
+          discard    = true      # Enable discard
+          emulatessd = true      # SSD emulation
+          iothread   = true      # Enable IO thread
+          format     = "raw"
+        }
+      }
+    }
   }
 
+  # Network
   network {
     id     = 0
     model  = "virtio"
-    bridge = local.proxmox_nodes[local.control_distribution[count.index]].bridge
+    bridge = var.proxmox_bridge[local.control_node_assignments[count.index]]
   }
+
+  # EFI disk for UEFI boot
+  efidisk {
+    efitype = "4m"
+    storage = var.proxmox_storage[local.control_node_assignments[count.index]]
+  }
+
+  # VM Settings
+  agent   = 1
+  hotplug = "disk,network,usb"  # No memory or CPU hotplug for Talos
 
   lifecycle {
     ignore_changes = [
-      boot,
       network,
+      disks,
     ]
   }
 }

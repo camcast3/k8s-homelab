@@ -13,6 +13,9 @@ crash.*.log
 *.tfvars
 *.tfvars.json
 
+# TF Generated Files
+infrastructure/tfplan
+
 # Ignore override files
 override.tf
 override.tf.json
@@ -42,3 +45,19 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Ansible vault
+ansible/group_vars/all/vault.yml
+
+# Ansible runtime files
+.ansible/*
+
+# Talos secrets
+talos/test-config/controlplane.yaml
+talos/test-config/talosconfig
+talos/test-config/worker.yaml
+talosconfig
+
+# Kubeconfigs
+*.kubeconfig
+kubeconfig

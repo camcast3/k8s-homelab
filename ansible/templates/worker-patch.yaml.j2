@@ -1,10 +1,11 @@
 machine:
   network:
-    hostname: {{ inventory_hostname }}
+    hostname: {{ item.inventory_hostname }}
     interfaces:
-      - interface: eth0
+      - interface: ens18
+        dhcp: false
         addresses:
-          - {{ talos_static_ip }}/24
+          - {{ item.talos_static_ip }}/24
         routes:
           - network: 0.0.0.0/0
             gateway: {{ gateway }}

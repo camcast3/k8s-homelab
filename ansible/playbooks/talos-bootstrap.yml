@@ -332,6 +332,10 @@
         dest: "{{ lookup('env', 'HOME') }}/.talos/config-{{ cluster_name }}"
         mode: '0600'
 
+# I want to automate changing the IP of a VM using the Unifi DHCP before bootstrapping
+
+# had to remove cdrom as the first boot for VM so that the hard disk was used instead
+
 # Set talosctl kubeconfig --talosconfig talosconfig
 
 # Setup https://docs.cilium.io/en/stable/gettingstarted/k8s-install-default/#k8s-install-quick

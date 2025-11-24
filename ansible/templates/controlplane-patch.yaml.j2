@@ -1,10 +1,11 @@
 machine:
   network:
-    hostname: {{ node_name }}
+    hostname: {{ item.inventory_hostname }}
     interfaces:
-      - interface: eth0
+      - interface: ens18
+        dhcp: false
         addresses:
-          - {{ node_ip }}/24
+          - {{ item.talos_static_ip }}/24
         routes:
           - network: 0.0.0.0/0
             gateway: {{ gateway }}
@@ -14,9 +15,16 @@ machine:
 {% for ns in nameservers %}
       - {{ ns }}
 {% endfor %}
+  certSANs:
+    - {{ cluster_vip }}
+{% for host in groups['talos_control_plane'] %}
+    - {{ hostvars[host].talos_static_ip }}
+{% endfor %}
+
 cluster:
-  controlPlane:
-    endpoint: https://{{ cluster_vip }}:6443
+  allowSchedulingOnControlPlanes: false
   network:
     cni:
-      name: none  # We'll install Cilium via ArgoCD later
+      name: none
+  proxy:
+    disabled: true

@@ -1,11 +1,11 @@
 machine:
   network:
-    hostname: {{ item.inventory_hostname }}
+    hostname: {{ node_name }}
     interfaces:
       - interface: ens18
         dhcp: false
         addresses:
-          - {{ item.talos_static_ip }}/24
+          - {{ node_ip }}/24
         routes:
           - network: 0.0.0.0/0
             gateway: {{ gateway }}
@@ -17,8 +17,8 @@ machine:
 {% endfor %}
   certSANs:
     - {{ cluster_vip }}
-{% for host in groups['talos_control_plane'] %}
-    - {{ hostvars[host].talos_static_ip }}
+{% for node in control_plane_ip_map %}
+    - {{ node.expected_ip }}
 {% endfor %}
 
 cluster:

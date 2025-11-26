@@ -61,3 +61,6 @@ talosconfig
 # Kubeconfigs
 *.kubeconfig
 kubeconfig
+talos/homelab-config/controlplane.yaml
+talos/homelab-config/worker.yaml
+ansible/vars/cluster_nodes.json

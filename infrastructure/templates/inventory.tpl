@@ -4,8 +4,10 @@ all:
       hosts:
 %{ for i, node in control_nodes ~}
         ${node.name}:
-          ansible_host: ${node.ip}
-          talos_static_ip: ${node.ip}
+          ansible_host: ${node.actual_ip != "" ? node.actual_ip : node.expected_ip}
+          vmid: ${node.vmid}
+          expected_ip: ${node.expected_ip}
+          actual_ip: ${node.actual_ip}
           mac_address: ${node.mac}
           node_type: control
 %{ endfor ~}
@@ -13,8 +15,10 @@ all:
       hosts:
 %{ for i, node in worker_nodes ~}
         ${node.name}:
-          ansible_host: ${node.ip}
-          talos_static_ip: ${node.ip}
+          ansible_host: ${node.actual_ip != "" ? node.actual_ip : node.expected_ip}
+          vmid: ${node.vmid}
+          expected_ip: ${node.expected_ip}
+          actual_ip: ${node.actual_ip}
           mac_address: ${node.mac}
           node_type: worker
 %{ endfor ~}

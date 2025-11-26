@@ -1,4 +1,8 @@
-- name: Discover Talos VM IPs
+---
+# =============================================================================
+# Section 1: Clean up Proxmox Boot Order
+# =============================================================================
+- name: Clean up Proxmox Boot Order
   hosts: localhost
   gather_facts: false
   vars_files:
@@ -9,371 +13,1009 @@
     proxmox_api_token_name: "opentofutokenPVE"
     proxmox_api_token_value: "{{ vault_proxmox_api_token_secret }}"
     proxmox_node: "pvebeast"
-    control_plane_vmids: [500, 501, 502]
-    worker_vmids: [510, 511, 512]
-  
+
   tasks:
-    - name: Debug - Show API credentials
-      ansible.builtin.debug:
-        msg:
-          - "Proxmox Host: {{ proxmox_host }}"
-          - "API User: {{ proxmox_api_user }}"
-          - "Token Name: {{ proxmox_api_token_name }}"
-          - "Token Value (first 10 chars): {{ proxmox_api_token_value[:10] }}..."
-          - "Node: {{ proxmox_node }}"
+    - name: Load inventory to get VMIDs
+      set_fact:
+        all_vmids: "{{ groups['talos_control_plane'] | map('extract', hostvars, 'vmid') | list + groups['talos_workers'] | map('extract', hostvars, 'vmid') | list }}"
 
-    - name: Debug - Test API connectivity
-      ansible.builtin.uri:
-        url: "https://{{ proxmox_host }}:8006/api2/json/version"
+    - name: Get current boot order for all VMs
+      uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item }}/config"
         method: GET
         headers:
           Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
         validate_certs: false
-        return_content: true
-      register: api_version_test
-      ignore_errors: false
+      register: vm_configs
+      loop: "{{ all_vmids }}"
 
-    - name: Debug - Show API version response
-      ansible.builtin.debug:
-        var: api_version_test
+    - name: Display current boot orders
+      debug:
+        msg: "VM {{ item.item }} boot order: {{ item.json.data.boot }}"
+      loop: "{{ vm_configs.results }}"
 
-    - name: Debug - Test single VM status
-      ansible.builtin.uri:
-        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ control_plane_vmids[0] }}/status/current"
-        method: GET
+    - name: Change VM boot order to scsi0 only (remove ide2)
+      uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item }}/config"
+        method: PUT
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
+        body_format: form-urlencoded
+        body:
+          boot: "order=scsi0"
+        validate_certs: false
+      register: boot_order_change
+      loop: "{{ all_vmids }}"
+
+    - name: Display boot order change results
+      debug:
+        msg: "VM {{ item.item }} boot order updated successfully"
+      loop: "{{ boot_order_change.results }}"
+      when: item.status == 200
+
+    - name: Reboot all VMs to apply boot order changes
+      uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item }}/status/reboot"
+        method: POST
         headers:
           Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
         validate_certs: false
-        return_content: true
-      register: vm_status_test
-      ignore_errors: false
+      register: reboot_result
+      loop: "{{ all_vmids }}"
 
-    - name: Debug - Show VM status response
-      ansible.builtin.debug:
-        var: vm_status_test
-
-    - name: Debug - Test guest agent call
-      ansible.builtin.uri:
-        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ control_plane_vmids[0] }}/agent/network-get-interfaces"
-        method: GET
-        headers:
-          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
-        validate_certs: false
-        return_content: true
-      register: guest_agent_test
-      ignore_errors: false
-
-    - name: Debug - Show guest agent response
-      ansible.builtin.debug:
-        var: guest_agent_test
-
-    - name: Get control plane DHCP IPs via Proxmox API
-      ansible.builtin.shell:
-        cmd: |
-          curl -k -s -H "Authorization: PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}" \
-            "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item }}/agent/network-get-interfaces" | \
-            jq -r '.data.result[] | select(.name=="ens18") | .["ip-addresses"][] | select(.["ip-address-type"]=="ipv4") | select(.["ip-address"] | startswith("127") | not) | .["ip-address"]'
-      register: control_dhcp_ips
-      loop: "{{ control_plane_vmids }}"
-      changed_when: false
-      retries: 10
-      delay: 5
-      until: control_dhcp_ips.stdout != ""
-
-    - name: Get worker DHCP IPs via Proxmox API
-      ansible.builtin.shell:
-        cmd: |
-          curl -k -s -H "Authorization: PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}" \
-            "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item }}/agent/network-get-interfaces" | \
-            jq -r '.data.result[] | select(.name=="ens18") | .["ip-addresses"][] | select(.["ip-address-type"]=="ipv4") | select(.["ip-address"] | startswith("127") | not) | .["ip-address"]'
-      register: worker_dhcp_ips
-      loop: "{{ worker_vmids }}"
-      changed_when: false
-      retries: 10
-      delay: 5
-      until: worker_dhcp_ips.stdout != ""
-
-    - name: Build dynamic inventory for control plane
-      ansible.builtin.add_host:
-        name: "talos-control-{{ idx + 1 }}"
-        groups: talos_control_plane
-        ansible_host: "{{ item.stdout }}"
-        talos_static_ip: "192.168.86.{{ 3 + idx }}"
-        vmid: "{{ control_plane_vmids[idx] }}"
-        node_type: control
-      loop: "{{ control_dhcp_ips.results }}"
-      loop_control:
-        index_var: idx
-
-    - name: Build dynamic inventory for workers
-      ansible.builtin.add_host:
-        name: "talos-worker-{{ idx + 1 }}"
-        groups: talos_workers
-        ansible_host: "{{ item.stdout }}"
-        talos_static_ip: "192.168.86.{{ 10 + idx }}"
-        vmid: "{{ worker_vmids[idx] }}"
-        node_type: worker
-      loop: "{{ worker_dhcp_ips.results }}"
-      loop_control:
-        index_var: idx
-
-    - name: Display discovered IPs
-      ansible.builtin.debug:
-        msg:
-          - "=== Discovered DHCP IPs ==="
-          - "Control Plane:"
-          - "{% for result in control_dhcp_ips.results %}  talos-control-{{ loop.index }}: {{ result.stdout }} -> 192.168.86.{{ 3 + loop.index0 }}{% endfor %}"
-          - "Workers:"
-          - "{% for result in worker_dhcp_ips.results %}  talos-worker-{{ loop.index }}: {{ result.stdout }} -> 192.168.86.{{ 10 + loop.index0 }}{% endfor %}"
-
-    - name: Confirm before continuing
+    - name: Wait for VMs to start rebooting
       pause:
-        prompt: "Look at the IP matches above and check if they match. Type 'yes' to continue or 'no' to abort."
-      register: user_response
+        seconds: 300
 
-    - name: Exit playbook if user says no
-      ansible.builtin.fail:
-        msg: "❌ Playbook aborted by user - IP validation failed"
-      when: user_response.user_input | lower not in ['yes', 'y']
+    - name: Wait for VMs to come back online
+      uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item }}/status/current"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
+        validate_certs: false
+      register: vm_status
+      until: vm_status.json.data.status == "running"
+      retries: 30
+      delay: 10
+      loop: "{{ all_vmids }}"
 
-    - name: Continue with tasks
-      ansible.builtin.debug:
-        msg: "Proceeding with the next steps..."
+    - name: Display VM status after reboot
+      debug:
+        msg: "VM {{ item.item }} is {{ item.json.data.status }}"
+      loop: "{{ vm_status.results }}"
 
-- name: Bootstrap Talos Cluster
+# =============================================================================
+# Section 2: Discover and Map Talos VM IPs
+# =============================================================================
+- name: Discover and Map Talos VM IPs
   hosts: localhost
   gather_facts: false
-  strategy: linear
+  vars_files:
+    - ../group_vars/all/vault.yml
   vars:
-    cluster_name: test
-    cluster_vip: "192.168.86.100"
-    gateway: "192.168.86.1"
-    nameservers: ["192.168.25.19"]
-    kubernetes_version: "v1.33.6"
-    talos_version: "v1.11.5"
-    # Factory image with QEMU guest agent support
-    qemu_installer_image: "factory.talos.dev/installer/ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515:v1.11.5"
-    config_dir: "~/repos/k8_homelab/talos/{{ cluster_name }}-config"
-    template_dir: "~/repos/k8_homelab/ansible/templates"
-    patch_dir: "~/repos/k8_homelab/ansible/patches"
+    proxmox_host: "{{ lookup('env', 'PROXMOX_HOST') | default('192.168.86.2', true) }}"
+    proxmox_api_user: "{{ lookup('env', 'PROXMOX_API_USER') | default('opentofu-prov@pve', true) }}"
+    proxmox_api_token_name: "opentofutokenPVE"
+    proxmox_api_token_value: "{{ vault_proxmox_api_token_secret }}"
+    proxmox_node: "pvebeast"
 
   tasks:
+    - name: Build control plane IP map from inventory
+      set_fact:
+        control_plane_ip_map: >-
+          {{
+            groups['talos_control_plane'] | map('extract', hostvars) | 
+            map(attribute='inventory_hostname') |
+            map('extract', hostvars) |
+            list |
+            map('dict2items') |
+            map('items2dict') |
+            list
+          }}
+
+    - name: Simplify control plane IP map
+      set_fact:
+        control_plane_ip_map: >-
+          {{
+            groups['talos_control_plane'] | map('extract', hostvars) |
+            map('combine', {'name': item}) |
+            list
+          }}
+      loop: "{{ groups['talos_control_plane'] }}"
+      when: false  # Skip this, use simpler approach below
+
+    - name: Create control plane IP map from inventory
+      set_fact:
+        control_plane_ip_map: []
+
+    - name: Build control plane IP map
+      set_fact:
+        control_plane_ip_map: >-
+          {{
+            control_plane_ip_map + [{
+              'name': item,
+              'vmid': hostvars[item].vmid,
+              'expected_ip': hostvars[item].expected_ip,
+              'actual_ip': hostvars[item].actual_ip,
+              'mac': hostvars[item].mac_address
+            }]
+          }}
+      loop: "{{ groups['talos_control_plane'] }}"
+
+    - name: Create worker IP map from inventory
+      set_fact:
+        worker_ip_map: []
+
+    - name: Build worker IP map
+      set_fact:
+        worker_ip_map: >-
+          {{
+            worker_ip_map + [{
+              'name': item,
+              'vmid': hostvars[item].vmid,
+              'expected_ip': hostvars[item].expected_ip,
+              'actual_ip': hostvars[item].actual_ip,
+              'mac': hostvars[item].mac_address
+            }]
+          }}
+      loop: "{{ groups['talos_workers'] }}"
+
+    - name: Get actual IPs from Proxmox for control plane nodes (verification)
+      uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item.vmid }}/agent/network-get-interfaces"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
+        validate_certs: false
+      register: control_actual_ips_verify
+      loop: "{{ control_plane_ip_map }}"
+      retries: 10
+      delay: 30
+      until: control_actual_ips_verify.status == 200
+
+    - name: Get actual IPs from Proxmox for worker nodes (verification)
+      uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item.vmid }}/agent/network-get-interfaces"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
+        validate_certs: false
+      register: worker_actual_ips_verify
+      loop: "{{ worker_ip_map }}"
+      retries: 10
+      delay: 30
+      until: worker_actual_ips_verify.status == 200
+
+    - name: Extract control plane current IPs from Proxmox
+      set_fact:
+        control_plane_current_ips: []
+
+    - name: Build control plane current IPs list
+      set_fact:
+        control_plane_current_ips: >-
+          {{
+            control_plane_current_ips + [
+              (item.json.data.result | 
+               selectattr('name', 'equalto', 'ens18') | 
+               map(attribute='ip-addresses') | 
+               first | 
+               selectattr('ip-address-type', 'equalto', 'ipv4') | 
+               map(attribute='ip-address') | 
+               first) | default(item.item.actual_ip)
+            ]
+          }}
+      loop: "{{ control_actual_ips_verify.results }}"
+
+    - name: Extract worker current IPs from Proxmox
+      set_fact:
+        worker_current_ips: []
+
+    - name: Build worker current IPs list
+      set_fact:
+        worker_current_ips: >-
+          {{
+            worker_current_ips + [
+              (item.json.data.result | 
+               selectattr('name', 'equalto', 'ens18') | 
+               map(attribute='ip-addresses') | 
+               first | 
+               selectattr('ip-address-type', 'equalto', 'ipv4') | 
+               map(attribute='ip-address') | 
+               first) | default(item.item.actual_ip)
+            ]
+          }}
+      loop: "{{ worker_actual_ips_verify.results }}"
+
+    - name: Update control plane IP map with live Proxmox data
+      set_fact:
+        control_plane_ip_map_updated: []
+
+    - name: Build updated control plane IP map
+      set_fact:
+        control_plane_ip_map_updated: >-
+          {{
+            control_plane_ip_map_updated + [
+              item.0 | combine({'current_ip': item.1})
+            ]
+          }}
+      loop: "{{ control_plane_ip_map | zip(control_plane_current_ips) | list }}"
+
+    - name: Replace control plane IP map
+      set_fact:
+        control_plane_ip_map: "{{ control_plane_ip_map_updated }}"
+
+    - name: Update worker IP map with live Proxmox data
+      set_fact:
+        worker_ip_map_updated: []
+
+    - name: Build updated worker IP map
+      set_fact:
+        worker_ip_map_updated: >-
+          {{
+            worker_ip_map_updated + [
+              item.0 | combine({'current_ip': item.1})
+            ]
+          }}
+      loop: "{{ worker_ip_map | zip(worker_current_ips) | list }}"
+
+    - name: Replace worker IP map
+      set_fact:
+        worker_ip_map: "{{ worker_ip_map_updated }}"
+
+    - name: Display IP mapping with live data from Proxmox
+      debug:
+        msg: |
+          Control Plane IP Mapping (live from Proxmox):
+          {% for node in control_plane_ip_map %}
+          - {{ node.name }} (VMID: {{ node.vmid }}): 
+            Current IP: {{ node.current_ip }}
+            Expected IP: {{ node.expected_ip }}
+            Status: {{ 'Already Configured' if node.current_ip == node.expected_ip else 'Needs Configuration' }}
+          {% endfor %}
+          
+          Worker IP Mapping (live from Proxmox):
+          {% for node in worker_ip_map %}
+          - {{ node.name }} (VMID: {{ node.vmid }}): 
+            Current IP: {{ node.current_ip }}
+            Expected IP: {{ node.expected_ip }}
+            Status: {{ 'Already Configured' if node.current_ip == node.expected_ip else 'Needs Configuration' }}
+          {% endfor %}
+
+    - name: Save IP mappings for next playbook section
+      set_fact:
+        all_nodes_map: "{{ control_plane_ip_map + worker_ip_map }}"
+        cacheable: true
+
+    - name: Verify IPs are discoverable
+      assert:
+        that:
+          - control_plane_ip_map | length > 0
+          - worker_ip_map | length > 0
+          - control_plane_ip_map | selectattr('actual_ip', 'equalto', '') | list | length == 0
+          - worker_ip_map | selectattr('actual_ip', 'equalto', '') | list | length == 0
+        fail_msg: "Failed to load VM IPs from inventory. Check hosts.yml file."
+        success_msg: "All VM IPs loaded successfully from inventory"
+
+# =============================================================================
+# Section 3: Bootstrap TalosOS Nodes
+# =============================================================================
+- name: Bootstrap TalosOS Nodes
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/vault.yml
+  vars:
+    # Pull from inventory vars instead of hardcoding
+    cluster_name: "{{ hostvars['localhost']['cluster_name'] | default('test') }}"
+    cluster_vip: "{{ hostvars['localhost']['cluster_vip'] | default('192.168.86.100') }}"
+    gateway: "{{ hostvars['localhost']['gateway'] | default('192.168.86.1') }}"
+    nameservers: "{{ hostvars['localhost']['nameservers'] | default(['192.168.25.19']) }}"
+    kubernetes_version: "v{{ hostvars['localhost']['kubernetes_version'] | default('1.33.6') }}"
+    talos_version: "{{ hostvars['localhost']['talos_version'] | default('v1.11.5') }}"
+    qemu_installer_image: "factory.talos.dev/installer/ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515:{{ talos_version }}"
+    config_dir: "/home/cameron/repos/k8_homelab/talos/{{ cluster_name }}-config"
+    template_dir: "/home/cameron/repos/k8_homelab/ansible/templates"
+    patch_dir: "/home/cameron/repos/k8_homelab/ansible/patches"
+    proxmox_host: "{{ lookup('env', 'PROXMOX_HOST') | default('192.168.86.2', true) }}"
+    proxmox_api_user: "{{ lookup('env', 'PROXMOX_API_USER') | default('opentofu-prov@pve', true) }}"
+    proxmox_api_token_name: "opentofutokenPVE"
+    proxmox_api_token_value: "{{ vault_proxmox_api_token_secret }}"
+    proxmox_node: "pvebeast"
+
+  tasks:
+    - name: Load IP mappings from previous play
+      set_fact:
+        control_plane_ip_map: "{{ hostvars['localhost']['control_plane_ip_map'] }}"
+        worker_ip_map: "{{ hostvars['localhost']['worker_ip_map'] }}"
+
     - name: Create Talos config directory
-      ansible.builtin.file:
+      file:
         path: "{{ config_dir }}"
         state: directory
         mode: '0755'
 
+    - name: Create patches directory
+      file:
+        path: "{{ patch_dir }}"
+        state: directory
+        mode: '0755'
+
     - name: Check if Talos config already exists
-      ansible.builtin.stat:
+      stat:
         path: "{{ config_dir }}/talosconfig"
       register: talos_config_exists
 
     - name: Generate Talos machine configurations with QEMU guest agent installer
-      ansible.builtin.command:
-        cmd: >
-          talosctl gen config {{ cluster_name }}
-          https://{{ cluster_vip }}:6443  
-          --output-dir {{ config_dir }}
-          --install-image {{ qemu_installer_image }}
+      command: >
+        talosctl gen config {{ cluster_name }} https://{{ cluster_vip }}:6443
+        --output-dir {{ config_dir }}
+        --kubernetes-version {{ kubernetes_version }}
+        --talos-version {{ talos_version }}
+        --install-image {{ qemu_installer_image }}
+      args:
+        creates: "{{ config_dir }}/talosconfig"
       when: not talos_config_exists.stat.exists
-      changed_when: true
 
-    - name: Create control plane patch files
-      ansible.builtin.template:
+    # TODO: enable kubelet certificate rotation https://docs.siderolabs.com/kubernetes-guides/monitoring-and-observability/deploy-metrics-server#node-configuration
+    - name: Create control plane patch files with expected IPs
+      template:
         src: "{{ template_dir }}/controlplane-patch.yaml.j2"
-        dest: "{{ patch_dir }}/controlplane-{{ item.inventory_hostname }}.yaml"
-        mode: '0644'
-      loop: "{{ groups['talos_control_plane'] | map('extract', hostvars) | list }}"
-      loop_control:
-        label: "{{ item.inventory_hostname }}"
-
-    - name: Create worker patch files
-      ansible.builtin.template:
+        dest: "{{ patch_dir }}/controlplane-{{ item.name }}-patch.yaml"
+      vars:
+        node_ip: "{{ item.expected_ip }}"
+        node_name: "{{ item.name }}"
+        patch_cluster_vip: "{{ cluster_vip }}"
+        patch_gateway: "{{ gateway }}"
+        patch_nameservers: "{{ nameservers }}"
+        patch_control_plane_ip_map: "{{ control_plane_ip_map }}"
+      loop: "{{ control_plane_ip_map }}"
+    
+    # TODO: enable kubelet certificate rotation https://docs.siderolabs.com/kubernetes-guides/monitoring-and-observability/deploy-metrics-server#node-configuration
+    - name: Create worker patch files with expected IPs
+      template:
         src: "{{ template_dir }}/worker-patch.yaml.j2"
-        dest: "{{ patch_dir }}/worker-{{ item.inventory_hostname }}.yaml"
-        mode: '0644'
-      loop: "{{ groups['talos_workers'] | map('extract', hostvars) | list }}"
-      loop_control:
-        label: "{{ item.inventory_hostname }}"
+        dest: "{{ patch_dir }}/worker-{{ item.name }}-patch.yaml"
+      vars:
+        node_ip: "{{ item.expected_ip }}"
+        node_name: "{{ item.name }}"
+        patch_gateway: "{{ gateway }}"
+        patch_nameservers: "{{ nameservers }}"
+      loop: "{{ worker_ip_map }}"
 
-    # - name: Confirm before continuing
-    #   pause:
-    #     prompt: "Look at the generated patches for debugging. Type 'yes' to continue or 'no' to abort."
-    #   register: user_response_patches
+    - name: Wait for guest agent to refresh after reboot
+      pause:
+        seconds: 30
+        prompt: "Waiting for guest agent to update IP information..."
 
-    # - name: Exit playbook if user says no
-    #   ansible.builtin.fail:
-    #     msg: "❌ Playbook aborted by user - patch review failed"
-    #   when: user_response_patches.user_input | lower not in ['yes', 'y']
+    - name: Re-query Proxmox for updated control plane IPs
+      uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item.vmid }}/agent/network-get-interfaces"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
+        validate_certs: false
+      register: control_actual_ips_refresh
+      loop: "{{ control_plane_ip_map }}"
+      retries: 5
+      delay: 5
+      until: control_actual_ips_refresh.status == 200
 
-    # - name: Continue with tasks
-    #   ansible.builtin.debug:
-    #     msg: "Proceeding with the next steps..."
+    - name: Re-query Proxmox for updated worker IPs
+      uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ item.vmid }}/agent/network-get-interfaces"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_name }}={{ proxmox_api_token_value }}"
+        validate_certs: false
+      register: worker_actual_ips_refresh
+      loop: "{{ worker_ip_map }}"
+      retries: 5
+      delay: 5
+      until: worker_actual_ips_refresh.status == 200
 
-    - name: Wait for Talos API to be available on control plane nodes
-      ansible.builtin.wait_for:
-        host: "{{ hostvars[item].ansible_host }}"
-        port: 50000
-        timeout: 300
-        delay: 10
-      loop: "{{ groups['talos_control_plane'] }}"
+    - name: Rebuild control plane current IPs list with fresh data
+      set_fact:
+        control_plane_current_ips_fresh: []
 
-    # - name: Apply configuration to control plane nodes
-    #   ansible.builtin.command:
-    #     cmd: >
-    #       talosctl apply-config
-    #       --insecure
-    #       --nodes {{ hostvars[item].ansible_host }}
-    #       --file {{ config_dir }}/controlplane.yaml
-    #       --config-patch @{{ playbook_dir }}/../patches/controlplane-{{ item }}.yaml
-    #   loop: "{{ groups['talos_control_plane'] }}"
-    #   changed_when: true
-    #   register: control_apply
-    #   retries: 3
-    #   delay: 10
-    #   until: control_apply.rc == 0
+    - name: Build refreshed control plane current IPs list
+      set_fact:
+        control_plane_current_ips_fresh: >-
+          {{
+            control_plane_current_ips_fresh + [
+              (item.json.data.result | 
+               selectattr('name', 'equalto', 'ens18') | 
+               map(attribute='ip-addresses') | 
+               first | 
+               selectattr('ip-address-type', 'equalto', 'ipv4') | 
+               map(attribute='ip-address') | 
+               first) | default(item.item.actual_ip)
+            ]
+          }}
+      loop: "{{ control_actual_ips_refresh.results }}"
 
-    - name: Wait for control plane nodes to reboot with static IPs
-      ansible.builtin.wait_for:
-        host: "{{ hostvars[item].talos_static_ip }}"
-        port: 50000
-        timeout: 300
-        delay: 30
-      loop: "{{ groups['talos_control_plane'] }}"
+    - name: Rebuild worker current IPs list with fresh data
+      set_fact:
+        worker_current_ips_fresh: []
 
-    - name: Wait for Talos API to be available on worker nodes
-      ansible.builtin.wait_for:
-        host: "{{ hostvars[item].ansible_host }}"
-        port: 50000
-        timeout: 300
-        delay: 10
-      loop: "{{ groups['talos_workers'] }}"
+    - name: Build refreshed worker current IPs list
+      set_fact:
+        worker_current_ips_fresh: >-
+          {{
+            worker_current_ips_fresh + [
+              (item.json.data.result | 
+               selectattr('name', 'equalto', 'ens18') | 
+               map(attribute='ip-addresses') | 
+               first | 
+               selectattr('ip-address-type', 'equalto', 'ipv4') | 
+               map(attribute='ip-address') | 
+               first) | default(item.item.actual_ip)
+            ]
+          }}
+      loop: "{{ worker_actual_ips_refresh.results }}"
 
-    # - name: Apply configuration to worker nodes
-    #   ansible.builtin.command:
-    #     cmd: >
-    #       talosctl apply-config
-    #       --insecure
-    #       --nodes {{ hostvars[item].ansible_host }}
-    #       --file {{ config_dir }}/worker.yaml
-    #       --config-patch @{{ playbook_dir }}/../patches/worker-{{ item }}.yaml
-    #   loop: "{{ groups['talos_workers'] }}"
-    #   changed_when: true
-    #   register: worker_apply
-    #   retries: 3
-    #   delay: 10
-    #   until: worker_apply.rc == 0
+    - name: Update control plane IP map with refreshed Proxmox data
+      set_fact:
+        control_plane_ip_map_refreshed: []
 
-    - name: Wait for worker nodes to reboot with static IPs
-      ansible.builtin.wait_for:
-        host: "{{ hostvars[item].talos_static_ip }}"
-        port: 50000
-        timeout: 300
-        delay: 30
-      loop: "{{ groups['talos_workers'] }}"
+    - name: Build refreshed control plane IP map
+      set_fact:
+        control_plane_ip_map_refreshed: >-
+          {{
+            control_plane_ip_map_refreshed + [
+              item.0 | combine({'current_ip': item.1})
+            ]
+          }}
+      loop: "{{ control_plane_ip_map | zip(control_plane_current_ips_fresh) | list }}"
 
-    - name: Check if cluster is already bootstrapped
-      ansible.builtin.command:
-        cmd: >
-          talosctl health
-          --talosconfig {{ config_dir }}/talosconfig
-      register: cluster_health
+    - name: Replace control plane IP map with refreshed data
+      set_fact:
+        control_plane_ip_map: "{{ control_plane_ip_map_refreshed }}"
+
+    - name: Update worker IP map with refreshed Proxmox data
+      set_fact:
+        worker_ip_map_refreshed: []
+
+    - name: Build refreshed worker IP map
+      set_fact:
+        worker_ip_map_refreshed: >-
+          {{
+            worker_ip_map_refreshed + [
+              item.0 | combine({'current_ip': item.1})
+            ]
+          }}
+      loop: "{{ worker_ip_map | zip(worker_current_ips_fresh) | list }}"
+
+    - name: Replace worker IP map with refreshed data
+      set_fact:
+        worker_ip_map: "{{ worker_ip_map_refreshed }}"
+
+    - name: Display generated patches for review
+      debug:
+        msg: |
+          Generated patches:
+          Control Plane Patches:
+          {% for node in control_plane_ip_map %}
+          - {{ patch_dir }}/controlplane-{{ node.name }}-patch.yaml (IP: {{ node.expected_ip }})
+          {% endfor %}
+          Worker Patches:
+          {% for node in worker_ip_map %}
+          - {{ patch_dir }}/worker-{{ node.name }}-patch.yaml (IP: {{ node.expected_ip }})
+          {% endfor %}
+
+    - name: Build control plane connection strategy based on Proxmox data
+      set_fact:
+        control_plane_strategy: []
+
+    - name: Add each control plane node to strategy
+      set_fact:
+        control_plane_strategy: >-
+          {{
+            control_plane_strategy + [{
+              'name': item.name,
+              'expected_ip': item.expected_ip,
+              'current_ip': item.current_ip,
+              'at_expected': item.current_ip == item.expected_ip,
+              'needs_config': item.current_ip != item.expected_ip
+            }]
+          }}
+      loop: "{{ control_plane_ip_map }}"
+
+    - name: Build worker connection strategy based on Proxmox data
+      set_fact:
+        worker_strategy: []
+
+    - name: Add each worker node to strategy
+      set_fact:
+        worker_strategy: >-
+          {{
+            worker_strategy + [{
+              'name': item.name,
+              'expected_ip': item.expected_ip,
+              'current_ip': item.current_ip,
+              'at_expected': item.current_ip == item.expected_ip,
+              'needs_config': item.current_ip != item.expected_ip
+            }]
+          }}
+      loop: "{{ worker_ip_map }}"
+
+    - name: Display connection strategy
+      debug:
+        msg: |
+          Node Connection Strategy:
+          Control Plane:
+          {% for node in control_plane_strategy %}
+          - {{ node.name }}: {{ 'Already at ' + node.expected_ip if node.at_expected else 'At ' + node.current_ip + ', will apply config to move to ' + node.expected_ip }}
+          {% endfor %}
+          Workers:
+          {% for node in worker_strategy %}
+          - {{ node.name }}: {{ 'Already at ' + node.expected_ip if node.at_expected else 'At ' + node.current_ip + ', will apply config to move to ' + node.expected_ip }}
+          {% endfor %}
+
+    - name: Check if nodes at expected IPs are responsive (detect reset scenarios)
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        --nodes {{ item.expected_ip }}
+        version
+      loop: "{{ control_plane_strategy + worker_strategy }}"
+      when: item.at_expected
+      register: node_responsive_check
       failed_when: false
       changed_when: false
 
+    - name: Update strategy for unresponsive nodes at expected IPs (reset scenario)
+      set_fact:
+        control_plane_strategy: >
+          {%- set ns = namespace(updated=[]) -%}
+          {%- for node in control_plane_strategy -%}
+            {%- set responsive = true -%}
+            {%- if node.at_expected -%}
+              {%- for check in node_responsive_check.results -%}
+                {%- if check.item.name == node.name and check.rc != 0 -%}
+                  {%- set responsive = false -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
+            {%- set _ = ns.updated.append(node | combine({'needs_config': not responsive or not node.at_expected, 'responsive': responsive})) -%}
+          {%- endfor -%}
+          {{ ns.updated }}
+        worker_strategy: >
+          {%- set ns = namespace(updated=[]) -%}
+          {%- for node in worker_strategy -%}
+            {%- set responsive = true -%}
+            {%- if node.at_expected -%}
+              {%- for check in node_responsive_check.results -%}
+                {%- if check.item.name == node.name and check.rc != 0 -%}
+                  {%- set responsive = false -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
+            {%- set _ = ns.updated.append(node | combine({'needs_config': not responsive or not node.at_expected, 'responsive': responsive})) -%}
+          {%- endfor -%}
+          {{ ns.updated }}
+
+    - name: Display updated strategy after responsiveness check
+      debug:
+        msg: |
+          Updated Node Strategy:
+          Control Plane:
+          {% for node in control_plane_strategy %}
+          - {{ node.name }}: {{ 'Responsive at ' + node.expected_ip + ' (skip config)' if (node.at_expected and node.responsive | default(true)) else ('Unresponsive at ' + node.expected_ip + ' (needs reconfig)' if node.at_expected else 'At ' + node.current_ip + ' (needs config)') }}
+          {% endfor %}
+          Workers:
+          {% for node in worker_strategy %}
+          - {{ node.name }}: {{ 'Responsive at ' + node.expected_ip + ' (skip config)' if (node.at_expected and node.responsive | default(true)) else ('Unresponsive at ' + node.expected_ip + ' (needs reconfig)' if node.at_expected else 'At ' + node.current_ip + ' (needs config)') }}
+          {% endfor %}
+
+    - name: Apply configuration to control plane nodes (only nodes needing config)
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        --nodes {{ item.at_expected | ternary(item.expected_ip, item.current_ip) }}
+        apply-config
+        --file {{ config_dir }}/controlplane.yaml
+        --config-patch @{{ patch_dir }}/controlplane-{{ item.name }}-patch.yaml
+        {{ '--insecure' if not item.at_expected else '' }}
+      loop: "{{ control_plane_strategy }}"
+      when: item.needs_config
+      register: control_apply_result
+
+    - name: Wait for control plane nodes to come up at expected IPs
+      wait_for:
+        host: "{{ item.item.expected_ip }}"
+        port: 50000
+        timeout: 300
+        delay: 30
+        state: started
+      loop: "{{ control_apply_result.results }}"
+      register: control_port_check
+      ignore_errors: true
+
+    - name: Fallback to ping check for control plane nodes if port check failed
+      command: ping -c 3 -W 2 {{ item.item.item.expected_ip }}
+      loop: "{{ control_port_check.results }}"
+      when: item.failed | default(false)
+      retries: 10
+      delay: 10
+      until: control_ping.rc == 0
+      register: control_ping
+
+    - name: Apply configuration to worker nodes (only nodes needing config)
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        --nodes {{ item.at_expected | ternary(item.expected_ip, item.current_ip) }}
+        apply-config
+        --file {{ config_dir }}/worker.yaml
+        --config-patch @{{ patch_dir }}/worker-{{ item.name }}-patch.yaml
+        {{ '--insecure' if not item.at_expected else '' }}
+      loop: "{{ worker_strategy }}"
+      when: item.needs_config
+      register: worker_apply_result
+
+    - name: Wait for worker nodes to come up at expected IPs
+      wait_for:
+        host: "{{ item.item.expected_ip }}"
+        port: 50000
+        timeout: 300
+        delay: 30
+        state: started
+      loop: "{{ worker_apply_result.results }}"
+      register: worker_port_check
+      ignore_errors: true
+
+    - name: Fallback to ping check for worker nodes if port check failed
+      command: ping -c 3 -W 2 {{ item.item.item.expected_ip }}
+      loop: "{{ worker_port_check.results }}"
+      when: item.failed | default(false)
+      retries: 10
+      delay: 10
+      until: worker_ping.rc == 0
+      register: worker_ping
+
+    - name: Display final node status
+      debug:
+        msg: |
+          All nodes verified and running at expected IPs:
+          Control Plane:
+          {% for node in control_plane_strategy %}
+          ✓ {{ node.name }}: {{ node.expected_ip }} {{ '(was already configured)' if node.at_expected else '(newly configured)' }}
+          {% endfor %}
+          Workers:
+          {% for node in worker_strategy %}
+          ✓ {{ node.name }}: {{ node.expected_ip }} {{ '(was already configured)' if node.at_expected else '(newly configured)' }}
+          {% endfor %}
+
+    - name: Check if cluster is already bootstrapped
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        --nodes {{ control_plane_strategy[0].expected_ip }}
+        get members
+      register: bootstrap_check
+      failed_when: false
+      changed_when: false
+
+    - name: Configure talosctl endpoints before bootstrap
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        config endpoint {{ control_plane_strategy | map(attribute='expected_ip') | join(' ') }}
+      when: bootstrap_check.rc != 0
+
+    - name: Set default talosctl node before bootstrap
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        config node {{ control_plane_strategy[0].expected_ip }}
+      when: bootstrap_check.rc != 0
+
     - name: Bootstrap the Talos cluster
-      ansible.builtin.command:
-        cmd: >
-          talosctl bootstrap
-          --nodes {{ hostvars[groups['talos_control_plane'][0]].talos_static_ip }}
-          --endpoints {{ hostvars[groups['talos_control_plane'][0]].talos_static_ip }}
-          --talosconfig {{ config_dir }}/talosconfig
-      when: cluster_health.rc != 0
-      changed_when: true
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        --nodes {{ control_plane_strategy[0].expected_ip }}
+        bootstrap
+      when: bootstrap_check.rc != 0
+      register: bootstrap_result
+
+    - name: Display bootstrap result
+      debug:
+        msg: "Cluster bootstrapped successfully on {{ control_plane_strategy[0].expected_ip }}"
+      when: bootstrap_result is changed
+
+    - name: Wait to bootstrap all controlplane nodes
+      pause:
+        seconds: 300
+        prompt: "Waiting for control plane nodes to stabilize after bootstrap..."
+      when: bootstrap_check.rc != 0
+
+    - name: Wait for Kubernetes API to be available
+      wait_for:
+        host: "{{ cluster_vip }}"
+        port: 6443
+        timeout: 300
+        delay: 10
 
     - name: Check if kubeconfig already exists
-      ansible.builtin.stat:
+      stat:
         path: "{{ config_dir }}/kubeconfig"
       register: kubeconfig_exists
 
     - name: Retrieve kubeconfig
-      ansible.builtin.command:
-        cmd: >
-          talosctl kubeconfig {{ config_dir }}/kubeconfig
-          --nodes {{ cluster_vip }}
-          --endpoints {{ cluster_vip }}
-          --talosconfig {{ config_dir }}/talosconfig
-          --force
-      when: not kubeconfig_exists.stat.exists or (kubeconfig_exists.stat.exists and cluster_health.rc != 0)
-      changed_when: true
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        --nodes {{ control_plane_strategy[0].expected_ip }}
+        kubeconfig {{ config_dir }}/kubeconfig
+      when: not kubeconfig_exists.stat.exists
 
     - name: Create .kube directory
-      ansible.builtin.file:
-        path: "{{ lookup('env', 'HOME') }}/.kube"
+      file:
+        path: "~/.kube"
         state: directory
         mode: '0755'
 
     - name: Create .talos directory
-      ansible.builtin.file:
-        path: "{{ lookup('env', 'HOME') }}/.talos"
+      file:
+        path: "~/.talos"
         state: directory
         mode: '0755'
 
     - name: Copy kubeconfig to user directory
-      ansible.builtin.copy:
+      copy:
         src: "{{ config_dir }}/kubeconfig"
-        dest: "{{ lookup('env', 'HOME') }}/.kube/config-{{ cluster_name }}"
+        dest: "~/.kube/config"
         mode: '0600'
+        force: yes
 
     - name: Copy talosconfig to user directory
-      ansible.builtin.copy:
+      copy:
         src: "{{ config_dir }}/talosconfig"
-        dest: "{{ lookup('env', 'HOME') }}/.talos/config-{{ cluster_name }}"
+        dest: "~/.talos/config"
         mode: '0600'
-
-# I want to automate changing the IP of a VM using the Unifi DHCP before bootstrapping
-
-# had to remove cdrom as the first boot for VM so that the hard disk was used instead
-
-# Set talosctl kubeconfig --talosconfig talosconfig
-
-# Setup https://docs.cilium.io/en/stable/gettingstarted/k8s-install-default/#k8s-install-quick
-
-# Install CNI Plugin Cillium https://docs.siderolabs.com/kubernetes-guides/cni/deploying-cilium#without-kube-proxy
-
-# Make sure Cilium is running properly with `cilium status` 
-
-# At this point all the nodes should be in a ready state
-
-    - name: Wait for all nodes to be ready
-      ansible.builtin.command:
-        cmd: kubectl get nodes --kubeconfig={{ config_dir }}/kubeconfig
-      register: nodes_status
-      until: nodes_status.stdout.find('NotReady') == -1
+        force: yes
       retries: 30
       delay: 10
-      changed_when: false
+      environment:
+        KUBECONFIG: "{{ config_dir }}/kubeconfig"
 
     - name: Display cluster access info
-      ansible.builtin.debug:
-        msg:
-          - "✅ Talos cluster bootstrapped successfully!"
-          - ""
-          - "Cluster Access:"
-          - "  Talos Config: {{ config_dir }}/talosconfig"
-          - "  Kubeconfig: {{ config_dir }}/kubeconfig"
-          - "  Cluster VIP: {{ cluster_vip }}"
-          - ""
-          - "Configs also copied to:"
-          - "  ~/.kube/config-{{ cluster_name }}"
-          - "  ~/.talos/config-{{ cluster_name }}"
-          - ""
-          - "Commands:"
-          - "  export TALOSCONFIG={{ config_dir }}/talosconfig"
-          - "  export KUBECONFIG={{ config_dir }}/kubeconfig"
-          - "  talosctl --nodes {{ cluster_vip }} dashboard"
-          - "  kubectl get nodes"
-          - ""
-          - "Node IPs:"
-          - "{% for host in groups['talos_control_plane'] %}  {{ host }}: {{ hostvars[host].talos_static_ip }}{% endfor %}"
+      debug:
+        msg: |
+          ✓ Talos cluster bootstrapped successfully!
+          
+          Cluster Endpoint: https://{{ cluster_vip }}:6443
+          
+          Kubeconfig: {{ config_dir }}/kubeconfig (copied to ~/.kube/config)
+          Talosconfig: {{ config_dir }}/talosconfig (copied to ~/.talos/config)
+          
+          Control Plane Nodes ({{ control_plane_ip_map | length }}):
+          {% for node in control_plane_ip_map %}
+          - {{ node.name }}: {{ node.expected_ip }}
+          {% endfor %}
+          
+          Worker Nodes ({{ worker_ip_map | length }}):
+          {% for node in worker_ip_map %}
+          - {{ node.name }}: {{ node.expected_ip }}
+          {% endfor %}
+          
+          Next: Install Cilium CNI
+
+# =============================================================================
+# Section 4: Install Cilium CNI
+# =============================================================================
+- name: Install Cilium CNI
+  hosts: localhost
+  gather_facts: false
+  vars:
+    cluster_name: "{{ hostvars['localhost']['cluster_name'] | default('test') }}"
+    cluster_vip: "{{ hostvars['localhost']['cluster_vip'] | default('192.168.86.100') }}"
+    config_dir: "/home/cameron/repos/k8_homelab/talos/{{ cluster_name }}-config"
+  
+  tasks:
+    - name: Verify Cilium CLI availability
+      command: which cilium
+      register: cilium_check
+      failed_when: false
+      changed_when: false
+
+    - name: Download and install Cilium CLI
+      shell: |
+        CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+        CLI_ARCH=amd64
+        curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+        sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+        sudo tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+        rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+      when: cilium_check.rc != 0
+
+    - name: Verify Cilium CLI installation
+      command: cilium version --client
+      register: cilium_version
+
+    - name: Show Cilium CLI version
+      debug:
+        var: cilium_version.stdout_lines
+
+    - name: Deploy Cilium without kube-proxy
+      shell: >
+        cilium install
+        --version 1.18.4
+        --namespace kube-system \
+        --set ipam.mode=kubernetes \
+        --set kubeProxyReplacement=true \
+        --set securityContext.capabilities.ciliumAgent="{CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}" \
+        --set securityContext.capabilities.cleanCiliumState="{NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}" \
+        --set cgroup.autoMount.enabled=false \
+        --set cgroup.hostRoot=/sys/fs/cgroup \
+        --set k8sServiceHost=localhost \
+        --set nodeIPAM.enabled=true \
+        --set defaultLBServiceIPAM=nodeipam \
+        --set externalIPs.enabled=true \
+        --set l2announcements.enabled=true \
+        --set k8sServicePort=7445
+
+    - name: Check Cilium status
+      command: cilium status --wait
+      register: cilium_status
+
+    - name: Display Cilium status
+      debug:
+        var: cilium_status.stdout_lines
+
+    # Update the controlplane to allow cilium-test-1 to bypass security policy with yaml patch
+
+    # Deploy test yaml for connectivity test
+
+    # Patch service to have a port 80 on ClusterIP
+
+    - name: Run Cilium connectivity test
+      command: cilium connectivity test
+      register: cilium_connectivity
+      ignore_errors: true
+
+    - name: Display final cluster state
+      debug:
+        msg: |
+          ✓ Cilium CNI installed successfully!
+
+          ✓ Cilium CNI Connectivity Tested!
+          
+          Next: Install ArgoCD
+
+
+## Verified everything up to this point
+
+# Install Metrics Server 
+# HA Version of the kubelet serving cert approver kubectl apply -f https://raw.githubusercontent.com/alex1989hu/kubelet-serving-cert-approver/main/deploy/ha-install.yaml   
+
+# HA verison of the metrics server kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/high-availability-1.21+.yaml
+
+# =============================================================================
+# Section 5: Install ArgoCD using Helm
+# =============================================================================
+- name: Install ArgoCD using Helm
+  hosts: localhost
+  gather_facts: false
+  vars:
+    cluster_name: "{{ hostvars['localhost']['cluster_name'] | default('test') }}"
+    cluster_vip: "{{ hostvars['localhost']['cluster_vip'] | default('192.168.86.100') }}"
+    config_dir: "~/repos/k8_homelab/talos/{{ cluster_name }}-config"
+    argocd_namespace: argocd
+    argocd_version: "7.7.12"
+    argocd_values_file: "~/repos/k8_homelab/ansible/values/argocd-values.yaml"
+
+  tasks:
+    - name: Create ArgoCD namespace
+      command: kubectl create namespace {{ argocd_namespace }}
+      register: namespace_create
+      failed_when: false
+      changed_when: namespace_create.rc == 0
+
+    - name: Add ArgoCD Helm repository
+      command: helm repo add argo https://argoproj.github.io/argo-helm
+
+    - name: Update Helm repositories
+      command: helm repo update
+
+    - name: Check if ArgoCD is already installed
+      command: helm list -n {{ argocd_namespace }}
+      register: helm_list
+      changed_when: false
+
+    - name: Install ArgoCD using Helm
+      command: >
+        helm install argocd argo/argo-cd
+        --namespace {{ argocd_namespace }}
+        --version {{ argocd_version }}
+        --values {{ argocd_values_file }}
+        --wait
+      when: "'argocd' not in helm_list.stdout"
+      register: argocd_install
+
+    - name: Wait for ArgoCD pods to be ready
+      command: >
+        kubectl wait --for=condition=ready pod
+        --selector app.kubernetes.io/name=argocd-server
+        --namespace {{ argocd_namespace }}
+        --timeout=300s
+
+    - name: Get ArgoCD admin password
+      command: >
+        kubectl get secret argocd-initial-admin-secret
+        -n {{ argocd_namespace }}
+        -o jsonpath="{.data.password}"
+      register: argocd_password_encoded
+
+    - name: Decode ArgoCD admin password
+      set_fact:
+        argocd_admin_password: "{{ argocd_password_encoded.stdout | b64decode }}"
+
+    - name: Get ArgoCD server service
+      command: kubectl get svc argocd-server -n {{ argocd_namespace }}
+      register: argocd_service
+
+    - name: Display ArgoCD access information
+      debug:
+        msg: |
+          ✓ ArgoCD installed successfully!
+          
+          Access ArgoCD:
+          - Username: admin
+          - Password: {{ argocd_admin_password }}
+          
+          To access ArgoCD UI:
+          kubectl port-forward svc/argocd-server -n {{ argocd_namespace }} 8080:443
+          
+          Then visit: https://localhost:8080
+          
+          To login via CLI:
+          argocd login localhost:8080 --username admin --password {{ argocd_admin_password }} --insecure
+          
+          {{ argocd_service.stdout }}
+          
+          ✓ Talos cluster fully bootstrapped and ready!
+
+    - name: Create ArgoCD CLI config directory
+      file:
+        path: "~/.argocd"
+        state: directory
+        mode: '0755'
+
+    - name: Save ArgoCD credentials
+      copy:
+        content: |
+          ArgoCD Access Information
+          =========================
+          Username: admin
+          Password: {{ argocd_admin_password }}
+          Namespace: {{ argocd_namespace }}
+          
+          Access via port-forward:
+          kubectl port-forward svc/argocd-server -n {{ argocd_namespace }} 8080:443
+          
+          URL: https://localhost:8080
+        dest: "{{ config_dir }}/argocd-credentials.txt"
+        mode: '0600'
+
+    - name: Final summary
+      debug:
+        msg: |
+          ================================================================================
+          🎉 Kubernetes Cluster Bootstrap Complete! 🎉
+          ================================================================================
+          
+          Cluster: {{ cluster_name }}
+          Endpoint: https://{{ cluster_vip }}:6443
+          
+          Components Installed:
+          ✓ TalosOS {{ hostvars['localhost']['talos_version'] | default('v1.11.5') }}
+          ✓ Kubernetes {{ hostvars['localhost']['kubernetes_version'] | default('1.33.6') }}
+          ✓ Cilium CNI
+          ✓ ArgoCD {{ argocd_version }}
+          
+          Configuration Files:
+          - Kubeconfig: ~/.kube/config
+          - Talosconfig: ~/.talos/config
+          - ArgoCD Credentials: {{ config_dir }}/argocd-credentials.txt
+          
+          Next Steps:
+          1. Access ArgoCD UI (see credentials above)
+          2. Deploy your applications via ArgoCD
+          3. Configure GitOps repositories
+          
+          ================================================================================

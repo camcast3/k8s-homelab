@@ -1,0 +1,174 @@
+## ArgoCD HA configuration values for Talos Kubernetes cluster
+
+## Global settings
+global:
+  domain: argocd.local
+
+## High Availability configuration
+## Redis HA for improved reliability
+redis-ha:
+  enabled: true
+  haproxy:
+    enabled: false
+  metrics:
+    enabled: true
+    image: oliver006/redis_exporter:v1.80.1-alpine@sha256:9c6a2f80054875ab36ca7020edbe68a1d05dd6745d030cc6317812ad14333897
+    port: 9121
+
+## Disable standalone Redis (use Redis HA instead)
+redis:
+  enabled: false
+
+## Controller configuration (manages application state)
+controller:
+  replicas: 3
+  metrics:
+    enabled: true
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+  pdb:
+    enabled: true
+    minAvailable: 1
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-application-controller
+          topologyKey: kubernetes.io/hostname
+
+## Server configuration (API server and UI)
+server:
+  replicas: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 50
+    targetMemoryUtilizationPercentage: 50
+  extraArgs:
+    - --insecure
+  service:
+    type: ClusterIP
+  ingress:
+    enabled: false
+  metrics:
+    enabled: true
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+  pdb:
+    enabled: true
+    minAvailable: 1
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-server
+          topologyKey: kubernetes.io/hostname
+
+## Repo server configuration (manages repository connections)
+repoServer:
+  replicas: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 50
+    targetMemoryUtilizationPercentage: 50
+  metrics:
+    enabled: true
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  pdb:
+    enabled: true
+    minAvailable: 1
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-repo-server
+          topologyKey: kubernetes.io/hostname
+
+## ApplicationSet controller (manages app-of-apps pattern)
+applicationSet:
+  enabled: true
+  replicas: 3
+  metrics:
+    enabled: true
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+  pdb:
+    enabled: true
+    minAvailable: 1
+
+## Notifications controller (alerts and notifications)
+notifications:
+  enabled: true
+  replicas: 3
+  metrics:
+    enabled: true
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+## Dex (disable if not using SSO)
+dex:
+  enabled: false
+
+## Configs
+configs:
+  repositories: {}
+  params:
+    server.insecure: true
+  cm:
+    timeout.reconciliation: 300s
+    application.resourceTrackingMethod: annotation
+    statusbadge.enabled: true
+    resource.exclusions: |
+      - apiGroups:
+        - cilium.io
+        kinds:
+        - CiliumIdentity
+        clusters:
+        - "*"
+  rbac:
+    policy.default: role:readonly
+    policy.csv: |
+      p, role:org-admin, applications, *, */*, allow
+      p, role:org-admin, clusters, get, *, allow
+      p, role:org-admin, repositories, *, *, allow
+      p, role:org-admin, logs, get, *, allow
+      p, role:org-admin, exec, create, */*, allow
+      g, admin, role:org-admin

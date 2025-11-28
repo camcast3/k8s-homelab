@@ -1,0 +1,4 @@
+ℹ️  Using Cilium version 1.18.4
+🔮 Auto-detected cluster name: homelab
+🔮 Auto-detected kube-proxy has not been installed
+ℹ️  Cilium will fully replace all functionalities of kube-proxy

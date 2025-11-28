@@ -353,8 +353,6 @@
         --kubernetes-version {{ kubernetes_version }}
         --talos-version {{ talos_version }}
         --install-image {{ qemu_installer_image }}
-      args:
-        creates: "{{ config_dir }}/talosconfig"
       when: not talos_config_exists.stat.exists
 
     # TODO: enable kubelet certificate rotation https://docs.siderolabs.com/kubernetes-guides/monitoring-and-observability/deploy-metrics-server#node-configuration
@@ -563,36 +561,62 @@
       failed_when: false
       changed_when: false
 
-    - name: Update strategy for unresponsive nodes at expected IPs (reset scenario)
+    - name: Build responsive nodes list
       set_fact:
-        control_plane_strategy: >
-          {%- set ns = namespace(updated=[]) -%}
-          {%- for node in control_plane_strategy -%}
-            {%- set responsive = true -%}
-            {%- if node.at_expected -%}
-              {%- for check in node_responsive_check.results -%}
-                {%- if check.item.name == node.name and check.rc != 0 -%}
-                  {%- set responsive = false -%}
-                {%- endif -%}
-              {%- endfor -%}
-            {%- endif -%}
-            {%- set _ = ns.updated.append(node | combine({'needs_config': not responsive or not node.at_expected, 'responsive': responsive})) -%}
-          {%- endfor -%}
-          {{ ns.updated }}
-        worker_strategy: >
-          {%- set ns = namespace(updated=[]) -%}
-          {%- for node in worker_strategy -%}
-            {%- set responsive = true -%}
-            {%- if node.at_expected -%}
-              {%- for check in node_responsive_check.results -%}
-                {%- if check.item.name == node.name and check.rc != 0 -%}
-                  {%- set responsive = false -%}
-                {%- endif -%}
-              {%- endfor -%}
-            {%- endif -%}
-            {%- set _ = ns.updated.append(node | combine({'needs_config': not responsive or not node.at_expected, 'responsive': responsive})) -%}
-          {%- endfor -%}
-          {{ ns.updated }}
+        responsive_nodes: >-
+          {{
+            node_responsive_check.results |
+            selectattr('rc', 'defined') |
+            selectattr('rc', 'equalto', 0) |
+            map(attribute='item.name') |
+            list
+          }}
+
+    - name: Initialize updated control plane strategy
+      set_fact:
+        control_plane_strategy_updated: []
+
+    - name: Build updated control plane strategy with responsiveness
+      set_fact:
+        control_plane_strategy_updated: >-
+          {{
+            control_plane_strategy_updated + [{
+              'name': item.name,
+              'expected_ip': item.expected_ip,
+              'current_ip': item.current_ip,
+              'at_expected': item.at_expected,
+              'responsive': (item.at_expected and item.name in responsive_nodes) | default(false),
+              'needs_config': (not item.at_expected) or (item.at_expected and item.name not in responsive_nodes)
+            }]
+          }}
+      loop: "{{ control_plane_strategy }}"
+
+    - name: Replace control plane strategy
+      set_fact:
+        control_plane_strategy: "{{ control_plane_strategy_updated }}"
+
+    - name: Initialize updated worker strategy
+      set_fact:
+        worker_strategy_updated: []
+
+    - name: Build updated worker strategy with responsiveness
+      set_fact:
+        worker_strategy_updated: >-
+          {{
+            worker_strategy_updated + [{
+              'name': item.name,
+              'expected_ip': item.expected_ip,
+              'current_ip': item.current_ip,
+              'at_expected': item.at_expected,
+              'responsive': (item.at_expected and item.name in responsive_nodes) | default(false),
+              'needs_config': (not item.at_expected) or (item.at_expected and item.name not in responsive_nodes)
+            }]
+          }}
+      loop: "{{ worker_strategy }}"
+
+    - name: Replace worker strategy
+      set_fact:
+        worker_strategy: "{{ worker_strategy_updated }}"
 
     - name: Display updated strategy after responsiveness check
       debug:
@@ -684,45 +708,92 @@
           ✓ {{ node.name }}: {{ node.expected_ip }} {{ '(was already configured)' if node.at_expected else '(newly configured)' }}
           {% endfor %}
 
-    - name: Check if cluster is already bootstrapped
-      command: >
-        talosctl --talosconfig {{ config_dir }}/talosconfig
-        --nodes {{ control_plane_strategy[0].expected_ip }}
-        get members
-      register: bootstrap_check
-      failed_when: false
-      changed_when: false
-
-    - name: Configure talosctl endpoints before bootstrap
+    - name: Configure talosctl endpoints
       command: >
         talosctl --talosconfig {{ config_dir }}/talosconfig
         config endpoint {{ control_plane_strategy | map(attribute='expected_ip') | join(' ') }}
-      when: bootstrap_check.rc != 0
 
-    - name: Set default talosctl node before bootstrap
+    - name: Set default talosctl node
       command: >
         talosctl --talosconfig {{ config_dir }}/talosconfig
         config node {{ control_plane_strategy[0].expected_ip }}
-      when: bootstrap_check.rc != 0
+
+    - name: Check etcd member status (primary bootstrap indicator)
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        --nodes {{ control_plane_strategy[0].expected_ip }}
+        etcd members
+      register: etcd_check
+      failed_when: false
+      changed_when: false
+
+    - name: Check cluster health status
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        health
+        --control-plane-nodes {{ control_plane_strategy | map(attribute='expected_ip') | join(',') }}
+        --wait-timeout 30s
+      register: health_check
+      failed_when: false
+      changed_when: false
+
+    - name: Set bootstrap_required flag based on etcd status
+      set_fact:
+        bootstrap_required: >-
+          {{
+            etcd_check.rc != 0 and
+            'AlreadyExists' not in (etcd_check.stderr | default('')) and
+            etcd_check.stdout | trim == ''
+          }}
+
+    - name: Display bootstrap status
+      debug:
+        msg: |
+          Bootstrap Detection:
+          ━━━━━━━━━━━━━━━━━━━━
+          etcd members check RC: {{ etcd_check.rc }}
+          etcd members output: {{ etcd_check.stdout | default('(empty)') | trim }}
+          etcd stderr: {{ etcd_check.stderr | default('(none)') | trim }}
+          Health check RC: {{ health_check.rc }}
+          
+          {% if not bootstrap_required %}
+          ✓ Cluster is already bootstrapped (etcd has members)
+          {% else %}
+          ⚠️ Cluster needs to be bootstrapped
+          {% endif %}
 
     - name: Bootstrap the Talos cluster
       command: >
         talosctl --talosconfig {{ config_dir }}/talosconfig
-        --nodes {{ control_plane_strategy[0].expected_ip }}
         bootstrap
-      when: bootstrap_check.rc != 0
+      when: bootstrap_required | bool
       register: bootstrap_result
+      failed_when: >
+        bootstrap_result.rc != 0 and
+        'AlreadyExists' not in bootstrap_result.stderr | default('')
 
     - name: Display bootstrap result
       debug:
-        msg: "Cluster bootstrapped successfully on {{ control_plane_strategy[0].expected_ip }}"
-      when: bootstrap_result is changed
+        msg: |
+          {% if bootstrap_result is changed and bootstrap_result.rc == 0 %}
+          ✓ Cluster bootstrapped successfully on {{ control_plane_strategy[0].expected_ip }}
+          {% elif 'AlreadyExists' in (bootstrap_result.stderr | default('')) %}
+          ✓ Cluster was already bootstrapped (etcd data exists)
+          {% else %}
+          ✓ Bootstrap skipped - cluster already bootstrapped
+          {% endif %}
+      when: bootstrap_result is defined or not bootstrap_required
 
-    - name: Wait to bootstrap all controlplane nodes
+    - name: Wait for control plane nodes to stabilize after bootstrap
       pause:
         seconds: 300
         prompt: "Waiting for control plane nodes to stabilize after bootstrap..."
-      when: bootstrap_check.rc != 0
+      when: bootstrap_required | bool
+
+    - name: Check if kubeconfig already exists
+      stat:
+        path: "{{ config_dir }}/kubeconfig"
+      register: kubeconfig_exists
 
     - name: Wait for Kubernetes API to be available
       wait_for:
@@ -730,11 +801,6 @@
         port: 6443
         timeout: 300
         delay: 10
-
-    - name: Check if kubeconfig already exists
-      stat:
-        path: "{{ config_dir }}/kubeconfig"
-      register: kubeconfig_exists
 
     - name: Retrieve kubeconfig
       command: >
@@ -805,8 +871,73 @@
     cluster_name: "{{ hostvars['localhost']['cluster_name'] | default('test') }}"
     cluster_vip: "{{ hostvars['localhost']['cluster_vip'] | default('192.168.86.100') }}"
     config_dir: "/home/cameron/repos/k8_homelab/talos/{{ cluster_name }}-config"
+    kubeconfig_path: "/home/cameron/repos/k8_homelab/talos/{{ cluster_name }}-config/kubeconfig"
+    cilium_install_version: "1.18.4"
   
   tasks:
+    - name: Load IP mappings from previous play
+      set_fact:
+        control_plane_ip_map: "{{ hostvars['localhost']['control_plane_ip_map'] | default(omit) }}"
+        worker_ip_map: "{{ hostvars['localhost']['worker_ip_map'] | default(omit) }}"
+        control_plane_strategy: "{{ hostvars['localhost']['control_plane_strategy'] | default(omit) }}"
+      failed_when: false
+
+    - name: Build control plane IP map from inventory if not loaded
+      set_fact:
+        control_plane_ip_map: >-
+          {{ groups['talos_control_plane'] | map('extract', hostvars) | 
+             map('dict2items') | map('selectattr', 'key', 'in', ['inventory_hostname', 'vmid', 'expected_ip', 'actual_ip', 'mac_address']) |
+             map('items2dict') | list }}
+      when: control_plane_ip_map is not defined or control_plane_ip_map | length == 0
+
+    - name: Fallback - build control plane IP map simply
+      block:
+        - name: Initialize control plane IP map
+          set_fact:
+            control_plane_ip_map: []
+
+        - name: Build control plane IP map from inventory
+          set_fact:
+            control_plane_ip_map: >-
+              {{
+                control_plane_ip_map + [{
+                  'name': item,
+                  'vmid': hostvars[item].vmid,
+                  'expected_ip': hostvars[item].expected_ip,
+                  'actual_ip': hostvars[item].actual_ip | default(hostvars[item].expected_ip),
+                  'mac': hostvars[item].mac_address
+                }]
+              }}
+          loop: "{{ groups['talos_control_plane'] }}"
+      when: control_plane_ip_map is not defined or control_plane_ip_map | length == 0
+
+    - name: Fallback - build worker IP map simply
+      block:
+        - name: Initialize worker IP map
+          set_fact:
+            worker_ip_map: []
+
+        - name: Build worker IP map from inventory
+          set_fact:
+            worker_ip_map: >-
+              {{
+                worker_ip_map + [{
+                  'name': item,
+                  'vmid': hostvars[item].vmid,
+                  'expected_ip': hostvars[item].expected_ip,
+                  'actual_ip': hostvars[item].actual_ip | default(hostvars[item].expected_ip),
+                  'mac': hostvars[item].mac_address
+                }]
+              }}
+          loop: "{{ groups['talos_workers'] }}"
+      when: worker_ip_map is not defined or worker_ip_map | length == 0
+
+    - name: Verify IP maps are loaded
+      debug:
+        msg: |
+          Control Plane IPs: {{ control_plane_ip_map | map(attribute='expected_ip') | list }}
+          Worker IPs: {{ worker_ip_map | map(attribute='expected_ip') | list }}
+
     - name: Verify Cilium CLI availability
       command: which cilium
       register: cilium_check
@@ -831,23 +962,78 @@
       debug:
         var: cilium_version.stdout_lines
 
+    - name: Check if Cilium is already installed
+      command: cilium status --wait=false
+      register: cilium_status
+      failed_when: false
+      changed_when: false
+
+    - name: Set Cilium installation status
+      set_fact:
+        cilium_installed: "{{ cilium_status.rc == 0 and 'Cilium' in cilium_status.stdout }}"
+
+    - name: Display Cilium status
+      debug:
+        msg: |
+          Cilium Status Check:
+          {% if cilium_installed %}
+          ✓ Cilium is already installed
+          {% else %}
+          ⚠️ Cilium not installed or not ready - will install
+          {% endif %}
+
     - name: Deploy Cilium without kube-proxy
-      shell: >
+      command: >
         cilium install
-        --version 1.18.4
-        --namespace kube-system \
-        --set ipam.mode=kubernetes \
-        --set kubeProxyReplacement=true \
-        --set securityContext.capabilities.ciliumAgent="{CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}" \
-        --set securityContext.capabilities.cleanCiliumState="{NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}" \
-        --set cgroup.autoMount.enabled=false \
-        --set cgroup.hostRoot=/sys/fs/cgroup \
-        --set k8sServiceHost=localhost \
-        --set nodeIPAM.enabled=true \
-        --set defaultLBServiceIPAM=nodeipam \
-        --set externalIPs.enabled=true \
-        --set l2announcements.enabled=true \
+        --version {{ cilium_install_version }}
+        --set ipam.mode=kubernetes
+        --set kubeProxyReplacement=true
+        --set securityContext.capabilities.ciliumAgent="{CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}"
+        --set securityContext.capabilities.cleanCiliumState="{NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}"
+        --set cgroup.autoMount.enabled=false
+        --set cgroup.hostRoot=/sys/fs/cgroup
+        --set k8sServiceHost=localhost
         --set k8sServicePort=7445
+        --set gatewayAPI.enabled=true
+        --set gatewayAPI.enableAlpn=true
+        --set gatewayAPI.enableAppProtocol=true
+        --set l2announcements.enabled=true
+        --set externalIPs.enabled=true
+        --set devices=ens18
+        --set hubble.enabled=true
+        --set hubble.relay.enabled=true
+        --set hubble.ui.enabled=true
+        --set prometheus.enabled=true
+        --set operator.prometheus.enabled=true
+        --set hubble.metrics.enabled="{dns,drop,tcp,flow,icmp,http}"
+      when: not cilium_installed
+      register: cilium_install_result
+
+    - name: Wait for Cilium to be ready
+      command: cilium status --wait
+      when: cilium_install_result is changed
+      register: cilium_wait
+      retries: 12
+      delay: 10
+      until: cilium_wait.rc == 0
+
+    - name: Display Cilium installation result
+      debug:
+        msg: |
+          {% if cilium_install_result is changed %}
+          ✓ Cilium {{ cilium_install_version }} installed successfully
+          {% else %}
+          ✓ Cilium was already installed - skipped installation
+          {% endif %}
+
+    - name: Verify Cilium final status
+      command: cilium status
+      register: cilium_final_status
+      changed_when: false
+
+    - name: Apply Cilium L2 test yaml
+      command: >
+        kubectl apply -f /home/cameron/repos/k8_homelab/kubernetes/cilium/test.yaml
 
     - name: Check Cilium status
       command: cilium status --wait
@@ -857,33 +1043,120 @@
       debug:
         var: cilium_status.stdout_lines
 
-    # Update the controlplane to allow cilium-test-1 to bypass security policy with yaml patch
+    - name: Update controlplane security policy exemption for cilium-test-1 namespace
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        patch mc
+        --patch '[{"op":"add","path":"/cluster/apiServer/admissionControl/0/configuration/exemptions/namespaces/-","value":"cilium-test-1"}]'
+        --nodes {{ control_plane_ip_map | map(attribute='expected_ip') | join(',') }}
 
-    # Deploy test yaml for connectivity test
+    - name: Deploy test yaml for connectivity test
+      command: >
+        kubectl apply -f https://raw.githubusercontent.com/cilium/cilium/1.18.4/examples/kubernetes/connectivity-check/connectivity-check.yaml
 
-    # Patch service to have a port 80 on ClusterIP
+    - name: Wait for echo-a pods to be ready
+      command: >
+        kubectl wait --for=condition=ready pod
+        --selector=app=echo-a
+        --namespace=cilium-test-1
+        --timeout=180s
+      register: echo_a_ready
+      retries: 3
+      delay: 10
+      until: echo_a_ready.rc == 0
+
+    - name: Wait for echo-b pods to be ready
+      command: >
+        kubectl wait --for=condition=ready pod
+        --selector=app=echo-b
+        --namespace=cilium-test-1
+        --timeout=180s
+      register: echo_b_ready
+      retries: 3
+      delay: 10
+      until: echo_b_ready.rc == 0
+
+    - name: Wait for echo-b-headless pods to be ready
+      command: >
+        kubectl wait --for=condition=ready pod
+        --selector=app=echo-b-headless
+        --namespace=cilium-test-1
+        --timeout=180s
+      register: echo_b_headless_ready
+      retries: 3
+      delay: 10
+      until: echo_b_headless_ready.rc == 0
+
+    - name: Patch service to have a port 80 on ClusterIP
+      command: >
+        kubectl -n cilium-test-1 patch svc echo-a-host-clusterip
+        --type='json'
+        -p='[{"op":"add","path":"/spec/ports","value":[{"port":80,"targetPort":8080,"protocol":"TCP"}]}]'
+
+    - name: Display connectivity test info
+      debug:
+        msg: |
+          ⏳ Cilium connectivity test is starting...
+          
+          This test performs comprehensive network validation including:
+          - Pod-to-pod communication
+          - Pod-to-service communication
+          - External connectivity
+          - Network policies
+          - Load balancing
+          - And more...
+          
+          Expected duration: 25-30 minutes (124 test scenarios)
+          Please wait...
 
     - name: Run Cilium connectivity test
-      command: cilium connectivity test
+      shell: cilium connectivity test
       register: cilium_connectivity
       ignore_errors: true
+      changed_when: false
+      async: 1800  # 30 minutes timeout
+      poll: 0
+
+    - name: Wait for connectivity test to complete
+      async_status:
+        jid: "{{ cilium_connectivity.ansible_job_id }}"
+      register: cilium_test_result
+      until: cilium_test_result.finished
+      retries: 30
+      delay: 60
+
+    - name: Display Cilium connectivity test results
+      debug:
+        msg: |
+          Cilium Connectivity Test Results:
+          {{ cilium_test_result.stdout_lines | join('\n') if cilium_test_result.rc == 0 else 'Test failed or had issues' }}
+
+    - name: Remove cilium-test namespace and resources
+      shell: kubectl delete namespace cilium-test --ignore-not-found=true
+      
+    - name: Revert security policy exemption on controlplane nodes
+      command: >
+        talosctl --talosconfig {{ config_dir }}/talosconfig
+        patch mc
+        --patch '[{"op":"replace","path":"/cluster/apiServer/admissionControl/0/configuration/exemptions/namespaces","value":["kube-system"]}]'
+        --nodes {{ control_plane_ip_map | map(attribute='expected_ip') | join(',') }}
+
+    - name: Display cleanup results
+      debug:
+        msg: |
+          ✓ Cilium test resources cleaned up
+          ✓ Security policy exemptions reverted to kube-system only
 
     - name: Display final cluster state
       debug:
         msg: |
           ✓ Cilium CNI installed successfully!
 
+          ✓ Hubble installed successfully!
+
           ✓ Cilium CNI Connectivity Tested!
           
           Next: Install ArgoCD
-
-
-## Verified everything up to this point
-
-# Install Metrics Server 
-# HA Version of the kubelet serving cert approver kubectl apply -f https://raw.githubusercontent.com/alex1989hu/kubelet-serving-cert-approver/main/deploy/ha-install.yaml   
-
-# HA verison of the metrics server kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/high-availability-1.21+.yaml
 
 # =============================================================================
 # Section 5: Install ArgoCD using Helm

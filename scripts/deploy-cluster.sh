@@ -57,7 +57,7 @@ log_info "All prerequisites found!"
 echo ""
 
 # Step 1: Provision infrastructure
-log_info "Step 1: Provisioning infrastructure with Terraform..."
+log_info "Step 1: Provisioning infrastructure with OpenTofu..."
 cd "$PROJECT_ROOT/infrastructure"
 
 if [ ! -f "creds.auto.tfvars" ]; then
@@ -70,7 +70,7 @@ if [ ! -f "machines.auto.tfvars" ]; then
     exit 1
 fi
 
-log_info "Initializing Terraform..."
+log_info "Initializing OpenTofu..."
 tofu init
 
 log_info "Planning infrastructure changes..."
@@ -101,7 +101,7 @@ log_info "Step 3: Configuring Talos Linux with Ansible..."
 cd "$PROJECT_ROOT/ansible"
 
 if [ ! -f "inventory/hosts.yml" ]; then
-    log_error "Ansible inventory not found. Terraform should have generated it."
+    log_error "Ansible inventory not found. OpenTofu should have generated it."
     exit 1
 fi
 
